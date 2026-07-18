@@ -1,18 +1,20 @@
 """
-Robot Primitives — OMPL approach + teleport grasp for pick-and-place.
+Robot Primitives — Suction gripper (weld constraint) pick-and-place.
 
 Strategy:
-1. plan_path (OMPL) to approach above object (collision-free)
-2. set_qpos teleport to grasp height (minimal displacement)
-3. control_dofs_position gripper close (gradual)
-4. set_qpos teleport to lift
+1. plan_path (OMPL) to approach above object
+2. Teleport to grasp height
+3. Weld constraint (suction) → object attaches to hand
+4. Teleport lift
+5. Teleport to target
+6. Unweld (release suction)
 
-Objects should be on a Kinematic table for stability.
-Uses standard panda.xml (works with OMPL plan_path).
+Objects: cubes/bottles on Kinematic table.
+Uses standard panda.xml + OMPL plan_path.
 """
 import numpy as np
 import torch
-from typing import List, Optional
+from typing import Optional
 
 
 class RobotPrimitives:
@@ -27,6 +29,7 @@ class RobotPrimitives:
 
         self.ee_link = self._find_link("hand", "link7", "panda_hand", "panda_link7")
         self.ee_link_idx = self._find_link_list_index(self.ee_link)
+        self.hand_solver_idx = self.robot.link_start + self.ee_link_idx
 
         robot.set_dofs_kp(
             kp=np.array([4500, 4500, 3500, 3500, 2000, 2000, 2000, 100, 100]),
@@ -34,11 +37,6 @@ class RobotPrimitives:
         )
         robot.set_dofs_kv(
             kv=np.array([450, 450, 350, 350, 200, 200, 200, 10, 10]),
-            dofs_idx_local=list(range(self.n_dofs)),
-        )
-        robot.set_dofs_force_range(
-            lower=np.array([-87, -87, -87, -87, -12, -12, -12, -100, -100]),
-            upper=np.array([87, 87, 87, 87, 12, 12, 12, 100, 100]),
             dofs_idx_local=list(range(self.n_dofs)),
         )
 
@@ -77,14 +75,12 @@ class RobotPrimitives:
     # ── Plan & Execute ───────────────────────────────────────
 
     def plan_and_execute(self, target_xyz, gripper_width=0.04, steps_per_wp=3):
-        """Plan collision-free path and execute. Returns True if path is valid."""
         device = self.robot.get_qpos().device
         qpos = self.solve_ik(target_xyz[0], target_xyz[1], target_xyz[2])
         target_arr = np.array(qpos)
         target_arr[-2:] = gripper_width
 
         path = self.robot.plan_path(qpos_goal=target_arr, num_waypoints=200)
-
         first = np.array(path[0].cpu().numpy()[:self.n_dofs])
         last = np.array(path[-1].cpu().numpy()[:self.n_dofs])
         if np.abs(last - first).max() < 1e-5:
@@ -92,15 +88,14 @@ class RobotPrimitives:
 
         for wp in path:
             wp_np = wp.cpu().numpy()[:self.n_dofs]
-            wp_tensor = torch.tensor(wp_np, dtype=torch.float32, device=device)
-            self.robot.control_dofs_position(wp_tensor)
+            self.robot.control_dofs_position(
+                torch.tensor(wp_np, dtype=torch.float32, device=device))
             self.scene.step(steps_per_wp)
         return True
 
     # ── Teleport ─────────────────────────────────────────────
 
     def teleport(self, target_xyz, gripper_width=0.04, settle_steps=50):
-        """Teleport arm to target XYZ via IK + set_qpos."""
         qpos = self.solve_ik(target_xyz[0], target_xyz[1], target_xyz[2])
         qpos_arr = np.array(qpos)
         qpos_arr[-2:] = gripper_width
@@ -115,65 +110,89 @@ class RobotPrimitives:
         self.robot.control_dofs_position(target, dofs_idx_local=self.gripper_dofs)
         self.scene.step(steps)
 
-    # ── Pick ─────────────────────────────────────────────────
+    # ── Suction Pick ─────────────────────────────────────────
 
-    def pick(self, object_pos, grasp_force=1.5, steps=500):
-        """Pick: plan approach → teleport grasp → close gripper → teleport lift."""
-        op = self._to_numpy(object_pos)
+    def suction_pick(self, object_name):
+        """Pick object using suction (weld constraint).
+
+        Returns: True if object was lifted.
+        """
+        obj = self.objects[object_name]
+        obj_pos = self._to_numpy(obj.get_pos())
+        obj_solver_idx = obj.link_start  # first link of the object
 
         # Open gripper
         self.open_gripper(0.04, steps=100)
 
-        # OMPL approach above cup
-        above = [op[0], op[1], op[2] + 0.15]
-        planned = self.plan_and_execute(above, gripper_width=0.04)
+        # OMPL approach above object
+        above = [obj_pos[0], obj_pos[1], obj_pos[2] + 0.08]
+        self.plan_and_execute(above, gripper_width=0.04)
 
-        # Re-read cup position
-        cup_now = self._to_numpy(self.objects['red_cup'].get_pos()) if 'red_cup' in self.objects else op
+        # Re-read object position
+        obj_now = self._to_numpy(obj.get_pos())
 
         # Teleport to grasp height
-        self.teleport([cup_now[0], cup_now[1], cup_now[2] + 0.05],
-                      gripper_width=0.04, settle_steps=100)
+        self.teleport([obj_now[0], obj_now[1], obj_now[2] + 0.02],
+                      gripper_width=0.04, settle_steps=50)
 
-        # Close gripper via control_dofs_position (gradual)
-        device = self.robot.get_qpos().device
-        current_arm = self.robot.get_qpos()[:self.n_arm].clone().to(device)
-        for i in range(steps):
-            t = (i + 1) / steps
-            gw = 0.04 - t * (0.04 - 0.032)
-            self.robot.control_dofs_position(current_arm, dofs_idx_local=self.arm_dofs)
-            self.robot.control_dofs_position(
-                torch.tensor([gw, gw], dtype=torch.float32, device=device),
-                dofs_idx_local=self.gripper_dofs,
-            )
-            self.scene.step(1)
-
-        # Force hold
-        force = torch.tensor([-grasp_force, -grasp_force],
-                             dtype=torch.float32, device=device)
-        for _ in range(100):
-            self.robot.control_dofs_position(current_arm, dofs_idx_local=self.arm_dofs)
-            self.robot.control_dofs_force(force, dofs_idx_local=self.gripper_dofs)
-            self.scene.step(1)
+        # Weld (suction)
+        self.scene.rigid_solver.add_weld_constraint(
+            self.hand_solver_idx, obj_solver_idx)
+        self.scene.step(50)
 
         # Teleport lift
-        cup_final = self._to_numpy(self.objects['red_cup'].get_pos()) if 'red_cup' in self.objects else cup_now
-        self.teleport([cup_final[0], cup_final[1], cup_final[2] + 0.20],
-                      gripper_width=0.032, settle_steps=200)
+        obj_lifted = self._to_numpy(obj.get_pos())
+        self.teleport([obj_lifted[0], obj_lifted[1], obj_lifted[2] + 0.15],
+                      gripper_width=0.04, settle_steps=100)
 
-    # ── Place ────────────────────────────────────────────────
+        # Check if lifted
+        final_z = self._to_numpy(obj.get_pos())[2]
+        return final_z > obj_pos[2] + 0.03
 
-    def place(self, target_pos, steps=500):
-        """Place: teleport above → teleport descend → open gripper → teleport lift."""
+    # ── Suction Place ────────────────────────────────────────
+
+    def suction_place(self, object_name, target_pos):
+        """Place object at target using suction release."""
+        obj = self.objects[object_name]
         tp = self._to_numpy(target_pos)
+        obj_solver_idx = obj.link_start
 
-        self.teleport([tp[0], tp[1], tp[2] + 0.12], gripper_width=0.032)
-        self.teleport([tp[0], tp[1], tp[2] + 0.02], gripper_width=0.032)
-        self.open_gripper(0.04, steps=steps)
-        self.teleport([tp[0], tp[1], tp[2] + 0.15], gripper_width=0.04)
+        # Approach above target
+        self.teleport([tp[0], tp[1], tp[2] + 0.15],
+                      gripper_width=0.04, settle_steps=50)
+
+        # Descend to target
+        self.teleport([tp[0], tp[1], tp[2] + 0.02],
+                      gripper_width=0.04, settle_steps=50)
+
+        # Unweld (release suction)
+        self.scene.rigid_solver.delete_weld_constraint(
+            self.hand_solver_idx, obj_solver_idx)
+        self.scene.step(50)
+
+        # Lift away
+        self.teleport([tp[0], tp[1], tp[2] + 0.15],
+                      gripper_width=0.04, settle_steps=50)
 
     # ── Pick & Place ─────────────────────────────────────────
 
-    def pick_and_place(self, object_pos, target_pos):
-        self.pick(object_pos)
-        self.place(target_pos)
+    def pick_and_place(self, object_name, target_pos):
+        """Full suction pick and place."""
+        lifted = self.suction_pick(object_name)
+        if lifted:
+            self.suction_place(object_name, target_pos)
+        return lifted
+
+    # ── Legacy interface (for orchestrator) ──────────────────
+
+    def pick(self, object_pos, grasp_force=1.5, steps=500):
+        """Legacy pick — uses first object in scene."""
+        if self.objects:
+            name = list(self.objects.keys())[0]
+            self.suction_pick(name)
+
+    def place(self, target_pos, steps=500):
+        """Legacy place — uses first object in scene."""
+        if self.objects:
+            name = list(self.objects.keys())[0]
+            self.suction_place(name, target_pos)
