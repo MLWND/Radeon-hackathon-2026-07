@@ -1,15 +1,14 @@
 """
-Robot Primitives — Proven working pick-and-place strategy.
+Robot Primitives — OMPL approach + teleport grasp for pick-and-place.
 
-VALIDATED on GPU (Genesis 1.2.2 + panda_no_tendon.xml):
-  Teleport z+0.10 → PD descend z+0.02 → close gripper → PD lift z+0.20
-  Cup lifted 2.4cm (SUCCESS).
+Strategy:
+1. plan_path (OMPL) to approach above object (collision-free)
+2. set_qpos teleport to grasp height (minimal displacement)
+3. control_dofs_position gripper close (gradual)
+4. set_qpos teleport to lift
 
-Key facts:
-- panda_no_tendon.xml: 9 DOFs (7 arm + 2 gripper)
-- Teleport z+0.10 is safe (cup moves ~1.6cm)
-- PD control on GPU converges to ~2mm (sufficient for grasp)
-- plan_path() fails with obstacles — use teleport+PD instead
+Objects should be on a Kinematic table for stability.
+Uses standard panda.xml (works with OMPL plan_path).
 """
 import numpy as np
 import torch
@@ -29,7 +28,6 @@ class RobotPrimitives:
         self.ee_link = self._find_link("hand", "link7", "panda_hand", "panda_link7")
         self.ee_link_idx = self._find_link_list_index(self.ee_link)
 
-        # Tutorial PD gains for Franka Panda
         robot.set_dofs_kp(
             kp=np.array([4500, 4500, 3500, 3500, 2000, 2000, 2000, 100, 100]),
             dofs_idx_local=list(range(self.n_dofs)),
@@ -57,10 +55,10 @@ class RobotPrimitives:
                 return i
         return len(self.robot.links) - 1
 
-    def _q_limit_tensors(self):
-        lims = torch.tensor(np.asarray(self.robot.q_limit), dtype=torch.float32,
-                            device=self.robot.get_qpos().device)
-        return lims[0], lims[1]
+    def _to_numpy(self, val):
+        if hasattr(val, 'cpu'):
+            return val.cpu().numpy()
+        return np.asarray(val)
 
     # ── IK ───────────────────────────────────────────────────
 
@@ -76,6 +74,39 @@ class RobotPrimitives:
         )
         return qpos.tolist()
 
+    # ── Plan & Execute ───────────────────────────────────────
+
+    def plan_and_execute(self, target_xyz, gripper_width=0.04, steps_per_wp=3):
+        """Plan collision-free path and execute. Returns True if path is valid."""
+        device = self.robot.get_qpos().device
+        qpos = self.solve_ik(target_xyz[0], target_xyz[1], target_xyz[2])
+        target_arr = np.array(qpos)
+        target_arr[-2:] = gripper_width
+
+        path = self.robot.plan_path(qpos_goal=target_arr, num_waypoints=200)
+
+        first = np.array(path[0].cpu().numpy()[:self.n_dofs])
+        last = np.array(path[-1].cpu().numpy()[:self.n_dofs])
+        if np.abs(last - first).max() < 1e-5:
+            return False
+
+        for wp in path:
+            wp_np = wp.cpu().numpy()[:self.n_dofs]
+            wp_tensor = torch.tensor(wp_np, dtype=torch.float32, device=device)
+            self.robot.control_dofs_position(wp_tensor)
+            self.scene.step(steps_per_wp)
+        return True
+
+    # ── Teleport ─────────────────────────────────────────────
+
+    def teleport(self, target_xyz, gripper_width=0.04, settle_steps=50):
+        """Teleport arm to target XYZ via IK + set_qpos."""
+        qpos = self.solve_ik(target_xyz[0], target_xyz[1], target_xyz[2])
+        qpos_arr = np.array(qpos)
+        qpos_arr[-2:] = gripper_width
+        self.robot.set_qpos(qpos_arr, list(range(self.n_dofs)))
+        self.scene.step(settle_steps)
+
     # ── Open Gripper ─────────────────────────────────────────
 
     def open_gripper(self, width=0.04, steps=100):
@@ -84,100 +115,62 @@ class RobotPrimitives:
         self.robot.control_dofs_position(target, dofs_idx_local=self.gripper_dofs)
         self.scene.step(steps)
 
-    # ── Close Gripper (force control) ────────────────────────
-
-    def close_gripper_force(self, force_per_finger=1.5, steps=500):
-        force = torch.tensor([-force_per_finger, -force_per_finger],
-                             dtype=torch.float32, device=self.robot.get_qpos().device)
-        self.robot.control_dofs_force(force, dofs_idx_local=self.gripper_dofs)
-        self.scene.step(steps)
-
-    # ── Pick (VALIDATED strategy) ────────────────────────────
+    # ── Pick ─────────────────────────────────────────────────
 
     def pick(self, object_pos, grasp_force=1.5, steps=500):
-        """Pick using proven teleport+PD strategy.
-
-        1. Open gripper
-        2. Teleport above cup (z+0.10) — PROVEN safe, cup moves ~1.6cm
-        3. PD descend to cup (z+0.02) — slow approach
-        4. Force-control close gripper
-        5. PD lift (z+0.20)
-        """
-        device = self.robot.get_qpos().device
-        lo, hi = self._q_limit_tensors()
+        """Pick: plan approach → teleport grasp → close gripper → teleport lift."""
+        op = self._to_numpy(object_pos)
 
         # Open gripper
         self.open_gripper(0.04, steps=100)
 
-        # Teleport above cup (PROVEN safe offset)
-        above_qpos = self.solve_ik(object_pos[0], object_pos[1], object_pos[2] + 0.10)
-        above_arr = np.array(above_qpos)
-        above_arr[-2:] = 0.04  # keep gripper open
-        self.robot.set_dofs_position(above_arr, list(range(self.n_dofs)))
+        # OMPL approach above cup
+        above = [op[0], op[1], op[2] + 0.15]
+        planned = self.plan_and_execute(above, gripper_width=0.04)
 
-        # PD descend to grasp height
-        grasp_joints = self.solve_ik(object_pos[0], object_pos[1], object_pos[2] + 0.02)
-        arm_target = torch.clamp(
-            torch.tensor(grasp_joints[:self.n_arm], dtype=torch.float32, device=device),
-            lo[:self.n_arm], hi[:self.n_arm],
-        )
-        gripper_open = torch.tensor(
-            [0.04] * len(self.gripper_dofs), dtype=torch.float32, device=device,
-        )
-        for _ in range(steps):
-            self.robot.control_dofs_position(arm_target, dofs_idx_local=self.arm_dofs)
-            self.robot.control_dofs_position(gripper_open, dofs_idx_local=self.gripper_dofs)
-            self.scene.step(1)
+        # Re-read cup position
+        cup_now = self._to_numpy(self.objects['red_cup'].get_pos()) if 'red_cup' in self.objects else op
 
-        # Force-control grasp
-        self.close_gripper_force(grasp_force, steps=steps)
+        # Teleport to grasp height
+        self.teleport([cup_now[0], cup_now[1], cup_now[2] + 0.05],
+                      gripper_width=0.04, settle_steps=100)
 
-        # PD lift
-        lift_joints = self.solve_ik(object_pos[0], object_pos[1], object_pos[2] + 0.20)
-        lift_target = torch.clamp(
-            torch.tensor(lift_joints[:self.n_arm], dtype=torch.float32, device=device),
-            lo[:self.n_arm], hi[:self.n_arm],
-        )
-        for _ in range(steps):
-            self.robot.control_dofs_position(lift_target, dofs_idx_local=self.arm_dofs)
+        # Close gripper via control_dofs_position (gradual)
+        device = self.robot.get_qpos().device
+        current_arm = self.robot.get_qpos()[:self.n_arm].clone().to(device)
+        for i in range(steps):
+            t = (i + 1) / steps
+            gw = 0.04 - t * (0.04 - 0.032)
+            self.robot.control_dofs_position(current_arm, dofs_idx_local=self.arm_dofs)
             self.robot.control_dofs_position(
-                torch.tensor([0.034] * len(self.gripper_dofs), dtype=torch.float32, device=device),
+                torch.tensor([gw, gw], dtype=torch.float32, device=device),
                 dofs_idx_local=self.gripper_dofs,
             )
             self.scene.step(1)
+
+        # Force hold
+        force = torch.tensor([-grasp_force, -grasp_force],
+                             dtype=torch.float32, device=device)
+        for _ in range(100):
+            self.robot.control_dofs_position(current_arm, dofs_idx_local=self.arm_dofs)
+            self.robot.control_dofs_force(force, dofs_idx_local=self.gripper_dofs)
+            self.scene.step(1)
+
+        # Teleport lift
+        cup_final = self._to_numpy(self.objects['red_cup'].get_pos()) if 'red_cup' in self.objects else cup_now
+        self.teleport([cup_final[0], cup_final[1], cup_final[2] + 0.20],
+                      gripper_width=0.032, settle_steps=200)
 
     # ── Place ────────────────────────────────────────────────
 
     def place(self, target_pos, steps=500):
-        device = self.robot.get_qpos().device
-        lo, hi = self._q_limit_tensors()
+        """Place: teleport above → teleport descend → open gripper → teleport lift."""
+        tp = self._to_numpy(target_pos)
 
-        # Teleport above target
-        above_qpos = self.solve_ik(target_pos[0], target_pos[1], target_pos[2] + 0.12)
-        above_arr = np.array(above_qpos)
-        above_arr[-2:] = 0.04
-        self.robot.set_dofs_position(above_arr, list(range(self.n_dofs)))
-
-        # PD descend
-        descend_joints = self.solve_ik(target_pos[0], target_pos[1], target_pos[2] + 0.02)
-        descend_target = torch.clamp(
-            torch.tensor(descend_joints[:self.n_arm], dtype=torch.float32, device=device),
-            lo[:self.n_arm], hi[:self.n_arm],
-        )
-        for _ in range(steps):
-            self.robot.control_dofs_position(descend_target, dofs_idx_local=self.arm_dofs)
-            self.robot.control_dofs_position(
-                torch.tensor([0.04] * len(self.gripper_dofs), dtype=torch.float32, device=device),
-                dofs_idx_local=self.gripper_dofs,
-            )
-            self.scene.step(1)
-
-        # Open gripper to release
+        self.teleport([tp[0], tp[1], tp[2] + 0.12], gripper_width=0.032)
+        self.teleport([tp[0], tp[1], tp[2] + 0.02], gripper_width=0.032)
         self.open_gripper(0.04, steps=steps)
-
-        # Teleport away
-        lift_joints = self.solve_ik(target_pos[0], target_pos[1], target_pos[2] + 0.15)
-        self.robot.set_dofs_position(np.array(lift_joints), list(range(self.n_dofs)))
+        self.teleport([tp[0], tp[1], tp[2] + 0.15], gripper_width=0.04)
 
     # ── Pick & Place ─────────────────────────────────────────
 
