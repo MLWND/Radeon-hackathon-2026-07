@@ -1,7 +1,6 @@
 """
-Module 2: Qwen VL Integration
-Single perception backbone: detect + ground + reason.
-Uses Qwen2.5-VL (latest available) with rule-based fallback.
+Qwen3-VL Perception Module
+Uses native Qwen3VLForConditionalGeneration from transformers>=4.57.
 """
 import numpy as np
 import json
@@ -11,38 +10,22 @@ from typing import Dict, Optional, List
 
 GROUNDING_PROMPT = """Analyze this image for a robotic pick-and-place task.
 
-User instruction: {instruction}
+Instruction: {instruction}
 
-You must:
-1. Identify the object to pick and the target location
-2. Provide bounding boxes in [x1, y1, x2, y2] format (normalized 0-1)
-3. Estimate 3D positions relative to the robot workspace
+You must identify:
+1. The object to pick (name from: {objects})
+2. Where to place it (coordinates on the table, x in [0.3,0.8], y in [-0.3,0.3])
 
 Output ONLY valid JSON:
 {{
-    "task": "pick_place",
-    "reasoning": "brief explanation",
-    "object": {{
-        "type": "object type",
-        "color": "color",
-        "bbox": [x1, y1, x2, y2],
-        "center_pixel": [cx, cy],
-        "estimated_xyz": [x, y, z],
-        "confidence": 0.95
-    }},
-    "target": {{
-        "type": "object type",
-        "color": "color",
-        "bbox": [x1, y1, x2, y2],
-        "center_pixel": [cx, cy],
-        "estimated_xyz": [x, y, z],
-        "confidence": 0.90
-    }}
+    "pick": "object_name",
+    "place_xyz": [x, y, z],
+    "reasoning": "brief explanation"
 }}"""
 
 
 class QwenVLWrapper:
-    def __init__(self, model_name: str = "Qwen/Qwen2.5-VL-3B-Instruct"):
+    def __init__(self, model_name: str = "Qwen/Qwen3-VL-2B-Instruct"):
         self.model_name = model_name
         self.model = None
         self.processor = None
@@ -52,46 +35,46 @@ class QwenVLWrapper:
     def load(self):
         try:
             import torch
-            from transformers import Qwen2_5_VLForConditionalGeneration, AutoProcessor
+            from transformers import Qwen3VLForConditionalGeneration, AutoProcessor
 
             self.processor = AutoProcessor.from_pretrained(self.model_name)
-            self.model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
+            self.model = Qwen3VLForConditionalGeneration.from_pretrained(
                 self.model_name,
                 torch_dtype=torch.float16,
                 device_map="auto",
-                attn_implementation="flash_attention_2" if hasattr(torch, 'flash_attention_2') else "sdpa",
             )
-            print(f"Qwen VL loaded: {self.model_name}")
+            print(f"Qwen3-VL loaded: {self.model_name} on {self.model.device}")
         except Exception as e:
-            print(f"Qwen VL load failed: {e}")
-            print("Using rule-based fallback")
+            print(f"Qwen3-VL load failed: {e}")
         return self
 
-    def understand(self, image: np.ndarray, instruction: str) -> Dict:
+    def understand(self, image: np.ndarray, instruction: str,
+                   objects: list, table_top: float = 0.05) -> Dict:
         start = time.time()
 
         if self.model is not None:
-            result = self._inference(image, instruction)
+            result = self._inference(image, instruction, objects, table_top)
         else:
-            result = self._rule_based(instruction)
+            result = self._rule_based(instruction, objects, table_top)
 
         self.last_inference_time = (time.time() - start) * 1000
         self.last_output = result
         return result
 
-    def _inference(self, image: np.ndarray, instruction: str) -> Dict:
+    def _inference(self, image, instruction, objects, table_top):
         from PIL import Image
         import torch
 
         pil_img = Image.fromarray(image)
-        prompt = GROUNDING_PROMPT.format(instruction=instruction)
+        prompt = GROUNDING_PROMPT.format(
+            instruction=instruction,
+            objects=", ".join(objects),
+        )
 
-        messages = [
-            {"role": "user", "content": [
-                {"type": "image", "image": pil_img},
-                {"type": "text", "text": prompt},
-            ]}
-        ]
+        messages = [{"role": "user", "content": [
+            {"type": "image", "image": pil_img},
+            {"type": "text", "text": prompt},
+        ]}]
 
         text = self.processor.apply_chat_template(
             messages, tokenize=False, add_generation_prompt=True
@@ -102,89 +85,45 @@ class QwenVLWrapper:
 
         with torch.no_grad():
             output = self.model.generate(
-                **inputs,
-                max_new_tokens=512,
-                do_sample=False,
+                **inputs, max_new_tokens=256, do_sample=False,
             )
 
         response = self.processor.decode(output[0], skip_special_tokens=True)
-        return self._parse_response(response, image.shape)
+        return self._parse_response(response, objects, table_top)
 
-    def _parse_response(self, response: str, image_shape: tuple) -> Dict:
+    def _parse_response(self, response, objects, table_top):
         try:
             start = response.find("{")
             end = response.rfind("}") + 1
             if start >= 0 and end > start:
                 result = json.loads(response[start:end])
-                return self._validate_and_fill(result, image_shape)
+                pick = result.get("pick", "")
+                place = result.get("place_xyz", [0.75, 0.2, table_top + 0.02])
+                if pick not in objects:
+                    pick = objects[0] if objects else "red_cube"
+                return {
+                    "pick": pick,
+                    "place_xyz": place,
+                    "reasoning": result.get("reasoning", ""),
+                }
         except json.JSONDecodeError:
             pass
-        return self._rule_based(response)
+        return self._rule_based(response, objects, table_top)
 
-    def _validate_and_fill(self, result: Dict, image_shape: tuple) -> Dict:
-        h, w = image_shape[:2]
-        for key in ["object", "target"]:
-            if key in result:
-                item = result[key]
-                if "bbox" in item:
-                    bbox = item["bbox"]
-                    item["center_pixel"] = [
-                        int((bbox[0] + bbox[2]) / 2 * w),
-                        int((bbox[1] + bbox[3]) / 2 * h),
-                    ]
-                if "estimated_xyz" not in item:
-                    item["estimated_xyz"] = self._pixel_to_xyz(
-                        item.get("center_pixel", [w//2, h//2])
-                    )
-                if "confidence" not in item:
-                    item["confidence"] = 0.85
-        return result
-
-    def _pixel_to_xyz(self, pixel: List[float]) -> List[float]:
-        x = (pixel[0] / 640 - 0.5) * 0.8
-        y = (pixel[1] / 480 - 0.5) * 0.6
-        z = 0.05
-        return [x, y, z]
-
-    def _rule_based(self, instruction: str) -> Dict:
-        instruction_lower = instruction.lower()
-        colors = ["red", "blue", "green", "yellow", "white", "black"]
-        objects = ["cup", "box", "cube", "bottle", "can"]
-
-        found_color = None
-        found_obj = None
-        for c in colors:
-            if c in instruction_lower:
-                found_color = c
+    def _rule_based(self, instruction, objects, table_top):
+        lower = instruction.lower()
+        pick = objects[0] if objects else "red_cube"
+        for name in objects:
+            color = name.split("_")[0]
+            if color in lower:
+                pick = name
                 break
-        for o in objects:
-            if o in instruction_lower:
-                found_obj = o
-                break
-
+        place_xyz = [0.75, 0.2, table_top + 0.02]
         return {
-            "task": "pick_place",
-            "reasoning": f"Rule-based: '{found_color or 'unknown'} {found_obj or 'object'}'",
-            "object": {
-                "type": found_obj or "cube",
-                "color": found_color or "unknown",
-                "bbox": [0.2, 0.3, 0.4, 0.6],
-                "center_pixel": [192, 230],
-                "estimated_xyz": [0.6, 0.0, 0.13],
-                "confidence": 0.80,
-            },
-            "target": {
-                "type": "box",
-                "color": "blue",
-                "bbox": [0.6, 0.3, 0.8, 0.6],
-                "center_pixel": [448, 230],
-                "estimated_xyz": [0.55, 0.2, 0.13],
-                "confidence": 0.80,
-            },
+            "pick": pick,
+            "place_xyz": place_xyz,
+            "reasoning": f"Rule-based fallback: pick {pick}",
         }
 
-    def get_inference_time(self) -> float:
+    def get_inference_time(self):
         return self.last_inference_time
-
-    def get_last_output(self) -> Optional[Dict]:
-        return self.last_output
