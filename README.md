@@ -1,72 +1,89 @@
-# Radeon-hackathon-2026-07
+# RoboPilot — Vision-Language Physical AI Robot
 
-## how to apply and use AMD Radeon GPU
-see [README](https://github.com/AMD-DEV-CONTEST/Radeon-hackathon-2026-07/blob/main/Radeon-Cloud-User%20Guide/README.md)
+> **Radeon Hackathon 2026-07, Track 3: Physical AI Challenge**
 
-## when you submit
-**pls fork this repo and open a pull request including the stuff that is mentioned in Rules&conditions of luma page. the title of pull request should be like "Track x, Team name, your application name"**
+Qwen3-VL (VLM) + Genesis (GPU Physics) + Suction Gripper (Weld Constraint) + AMD ROCm
+
+## Quick Start
+
+```bash
+# 1. Setup (one-time)
+bash setup.sh
+
+# 2. Run full demo
+source venv/bin/activate
+python3 demo/full_demo.py
+```
+
+## What It Does
+
+User says: **"Pick the red cube and place it next to the blue cube"**
+
+```
+Qwen3-VL  →  identifies red_cube, plans placement
+Genesis   →  OMPL path planning, suction pick, place
+Camera    →  verifies before/after, confirms success
+```
+
+**Full pipeline: ~14s end-to-end on AMD ROCm GPU**
+
+## Demo Results
+
+| Metric | Value |
+|--------|-------|
+| VLM Model | Qwen3-VL-2B (native Qwen3VLForConditionalGeneration) |
+| VLM Inference | 6s |
+| Suction Pick | 7s |
+| Suction Place | 0.1s |
+| Placement Error | 5.3cm |
+| Status | **SUCCESS** |
+
+## Tech Stack
+
+| Component | Technology |
+|-----------|-----------|
+| VLM | Qwen/Qwen3-VL-2B-Instruct |
+| Physics | Genesis 1.2.2 (gs.amdgpu) |
+| Robot | Franka Panda (MJCF) |
+| Gripper | Suction (weld constraint) |
+| GPU | AMD Radeon, ROCm 7.2, 48GB VRAM |
+| Framework | PyTorch 2.9.1+rocm7.2 |
+
+## Key Innovation: Suction Gripper via Weld Constraint
+
+Instead of unreliable parallel finger grasp, we use Genesis weld constraints — the official industrial approach:
+
+```python
+# Pick: attach object to hand
+scene.rigid_solver.add_weld_constraint(hand_link, object_link)
+
+# Place: detach object
+scene.rigid_solver.delete_weld_constraint(hand_link, object_link)
+```
+
+## Project Docs
+
+- [Architecture](docs/ARCHITECTURE.md) — system design and module list
+- [MVP Plan](docs/MVP.md) — development timeline and results
+- [Technical README](docs/README.md) — detailed pipeline and performance
+
+---
+
+## How to Apply and Use AMD Radeon GPU
+
+See [README](https://github.com/AMD-DEV-CONTEST/Radeon-hackathon-2026-07/blob/main/Radeon-Cloud-User%20Guide/README.md)
+
+## When You Submit
+
+**Please fork this repo and open a pull request** including the stuff mentioned in Rules & Conditions of the Luma page. The title of the pull request should be like "Track x, Team name, your application name".
 
 > [!NOTE]
 > All submission materials, project descriptions, and Pull Requests should be submitted in English.
 
-## Submission Requirements
+## Submission Requirements (Track 3)
 
-### Track 1: Development of Multimodal Content Creation Tools
-
-1. **Project Profile Document (PDF)**
-   - Project background
-   - Target users & application scenarios
-   - System architecture
-   - Model & algorithm introduction
-   - Adaptation description for AMD Radeon GPU / ROCm
-2. **Project Source Code**
-   - Complete source code repository
-   - README file including environment configuration, startup guide and dependency list
-3. **Demo Video**
-   - Recommended duration: 3–5 minutes
-   - Demonstrate the actual operation process
-   - The actual execution performance on an AMD Radeon GPU, from command line/GUI to the final result (clarity, stability and diversity of outputs)
-4. **Supplementary Materials (Choose One)**
-   - PPT / Poster (highlight creative scenarios, practical value of the tool)
-
-### Track 2: Development & Local Deployment of Private AI Agents
-
-1. **Project Specification Document**
-   - Application scenarios
-   - Agent architecture diagram
-   - Introduction to core capabilities
-   - Model introduction & local deployment plan
-   - Optimization description for inference speed on AMD Radeon GPU
-2. **Project Source Code**
-   - Complete source code repository
-   - README file including environment configuration, startup guide and dependency list
-3. **Demo Video**
-   - Recommended duration: 3–5 minutes
-   - Demonstrate the actual operation process
-   - The actual execution performance on an AMD Radeon GPU, from command line/GUI to the final result (fluidity and functional completeness)
-4. **Supplementary Materials (Choose One)**
-   - PPT / Poster
-
-### Track 3: Physical AI Challenge – Robotics Simulation and Application Design based on AMD Radeon GPUs and ROCm
-
-1. **Technical Report** (should include, but is not limited to):
-   - Definition and description of the target application
-   - Overall system architecture and solution design
-   - Description of the datasets used for training and/or evaluation
-   - Explanation of how AMD Radeon GPUs are utilized during training, inference, and other relevant stages
-   - Description of the innovations, key technical contributions, and important aspects of the project
-   - Description of the final deliverables and output forms of the project
-   - Any additional information that participants believe highlights the strengths or unique aspects of their work
-   - Introduction of team members and their respective contributions
-2. **Project Source Code**
-   - Dedicated source code repositories
-   - A Docker image containing the complete source code and all required components for running the project would be preferable
-3. **Reproducibility Instruction README** — a detailed README document containing:
-   - Environment setup instructions
-   - Execution and usage instructions
-   - Dependency specifications
-   - Step-by-step reproduction procedures
-   - Following the provided instructions should allow evaluators to reproduce the submitted results
-4. **Demonstration Video** (Recommended Length 3~5 minutes)
-   - The video should demonstrate the complete workflow of the project, including command-line and/or GUI operations, execution procedures, and results
-5. **Supplementary materials** in other formats may be submitted to demonstrate the value of the proposed technical solution.
+1. **Technical Report** — system architecture, AMD GPU utilization, innovations
+2. **Project Source Code** — complete repository + Docker image
+3. **Reproducibility README** — environment setup, execution instructions
+4. **Demo Video** — 3-5 minutes, complete workflow on AMD GPU
+5. **Supplementary materials** — PPT / Poster
