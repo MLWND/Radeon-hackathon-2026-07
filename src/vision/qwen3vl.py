@@ -1,6 +1,6 @@
 """
 Qwen3-VL Perception Module
-Uses native Qwen3VLForConditionalGeneration.
+Uses official AutoModelForImageTextToText API (transformers>=4.57).
 Outputs relative spatial descriptions, not absolute coordinates.
 Scene memory resolves to precise Genesis coordinates.
 """
@@ -41,12 +41,12 @@ class QwenVLWrapper:
     def load(self):
         try:
             import torch
-            from transformers import Qwen3VLForConditionalGeneration, AutoProcessor
+            from transformers import AutoModelForImageTextToText, AutoProcessor
 
             self.processor = AutoProcessor.from_pretrained(self.model_name)
-            self.model = Qwen3VLForConditionalGeneration.from_pretrained(
+            self.model = AutoModelForImageTextToText.from_pretrained(
                 self.model_name,
-                torch_dtype=torch.float16,
+                dtype="auto",
                 device_map="auto",
             )
             print(f"Qwen3-VL loaded: {self.model_name} on {self.model.device}")
