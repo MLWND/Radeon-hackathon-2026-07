@@ -39,6 +39,11 @@ class RobotPrimitives:
         # P1-16: Contact sensors
         self.contact_sensor = None
 
+        # Store original object positions for reset
+        self.original_positions = {}
+        for name, obj in self.objects.items():
+            self.original_positions[name] = self._to_numpy(obj.get_pos()).copy()
+
         # PD gains
         robot.set_dofs_kp(np.array([4500,4500,3500,3500,2000,2000,2000,100,100]),
                           dofs_idx_local=list(range(self.n_dofs)))
@@ -117,8 +122,13 @@ class RobotPrimitives:
     def reset(self):
         self.episode_step = 0
         self.done = False
+        # Reset arm to home position
         home = np.concatenate([np.zeros(self.n_arm), [0.04, 0.04]])
         self.robot.set_qpos(home, list(range(self.n_dofs)))
+        # Reset objects to original positions
+        for name, orig_pos in self.original_positions.items():
+            if name in self.objects:
+                self.objects[name].set_pos(orig_pos)
         self.scene.step(100)
         return self._get_obs()
 
