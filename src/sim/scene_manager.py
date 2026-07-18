@@ -24,11 +24,10 @@ class SceneConfig:
 
 
 # ── Asset Paths ──────────────────────────────────────────────
-# Use panda.xml (standard) — compatible with plan_path() OMPL motion planner.
-# The no_tendon variant has collision geometry issues with RRTConnect.
+# panda_no_tendon.xml: proven working with teleport+PD strategy.
 _GENESIS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)),
     "../../venv/lib/python3.12/site-packages/genesis/assets")
-FRANKA_MJCF = os.path.join(_GENESIS_DIR, "xml/franka_emika_panda/panda.xml")
+FRANKA_MJCF = os.path.join(_GENESIS_DIR, "xml/franka_emika_panda/panda_no_tendon.xml")
 FRANKA_URDF = os.path.join(_GENESIS_DIR, "urdf/panda_bullet/panda.urdf")
 
 
@@ -152,24 +151,7 @@ class SceneManager:
 
     def build(self):
         self.scene.build()
-        # Set robot to safe initial configuration (avoids joint limit warnings
-        # and ensures plan_path can find collision-free trajectories)
-        self._set_safe_config()
         return self
-
-    def _set_safe_config(self):
-        """Set Franka to a safe configuration after build."""
-        import torch
-        if self.robot is None or self.robot.n_dofs < 7:
-            return
-        safe_qpos = torch.tensor(
-            [0, 0, 0, -1.0, 0, 1.0, 0, 0.04, 0.04][: self.robot.n_dofs],
-            dtype=torch.float32, device=self.robot.get_qpos().device,
-        )
-        self.robot.set_dofs_position(safe_qpos, list(range(self.robot.n_dofs)))
-        # Let physics settle
-        for _ in range(200):
-            self.scene.step()
 
     def step(self, n=1):
         for _ in range(n):
@@ -239,30 +221,20 @@ def create_tabletop_scene(show_viewer=False) -> SceneManager:
         SceneManager(config)
         .init_genesis()
         .add_ground()
-        .add_table(pos=(0.3, 0, TABLE_HEIGHT / 2))
-        .add_robot(use_mjcf=True)  # MJCF has correct hand/finger links for IK
+        .add_robot(use_mjcf=True)  # MJCF panda.xml for OMPL compatibility
     )
 
-    # ── 8 objects: varied shapes, colors, positions ────────────
-    # Row 1 (front, closer to robot)
-    scene.add_cup("red_cup", pos=(0.15, 0.12, TABLE_TOP + 0.04))
-    scene.add_box("blue_box", pos=(-0.1, 0.15, TABLE_TOP + 0.035))
-    scene.add_sphere("green_apple", radius=0.03, pos=(0.25, -0.05, TABLE_TOP + 0.03))
-
-    # Row 2 (middle)
-    scene.add_bottle("yellow_bottle", pos=(-0.15, -0.08, TABLE_TOP + 0.075))
-    scene.add_sphere("red_tomato", radius=0.025, pos=(0.08, 0.0, TABLE_TOP + 0.025))
-
-    # Row 3 (back, further from robot)
-    scene.add_cup("blue_mug", pos=(0.3, 0.0, TABLE_TOP + 0.04))
-    scene.add_box("white_cube", pos=(0.15, -0.12, TABLE_TOP + 0.025))
-    scene.add_sphere("orange_ball", radius=0.02, pos=(-0.05, -0.15, TABLE_TOP + 0.02))
-
-    # ── Lighting ──────────────────────────────────────────────
-    # Genesis uses default scene lighting. For custom lighting:
-    # - RayTracer: use scene.add_mesh_light(morph, color, intensity)
-    # - BatchRenderer: use scene.add_light(pos, dir, color, intensity)
-    # Renderer-specific code omitted to maintain portability.
+    # ── 8 objects on ground plane ─────────────────────────────
+    # Objects placed in safe zone (x ≥ 0.45) to avoid robot collision zone.
+    # No table — objects rest on ground plane for reliable physics and OMPL planning.
+    scene.add_cup("red_cup", pos=(0.55, 0.0, 0.04))
+    scene.add_box("blue_box", pos=(0.45, 0.2, 0.035))
+    scene.add_sphere("green_apple", radius=0.03, pos=(0.6, -0.1, 0.03))
+    scene.add_bottle("yellow_bottle", pos=(0.4, -0.15, 0.075))
+    scene.add_sphere("red_tomato", radius=0.025, pos=(0.5, 0.1, 0.025))
+    scene.add_cup("blue_mug", pos=(0.6, 0.15, 0.04))
+    scene.add_box("white_cube", pos=(0.45, -0.1, 0.025))
+    scene.add_sphere("orange_ball", radius=0.02, pos=(0.55, -0.15, 0.02))
 
     scene.add_camera()
     scene.build()
