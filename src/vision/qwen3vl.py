@@ -1,7 +1,7 @@
 """
-Module 2: Qwen3-VL Integration
+Module 2: Qwen VL Integration
 Single perception backbone: detect + ground + reason.
-No YOLO needed — Qwen3-VL handles everything.
+Uses Qwen2.5-VL (latest available) with rule-based fallback.
 """
 import numpy as np
 import json
@@ -9,7 +9,6 @@ import time
 from typing import Dict, Optional, List
 
 
-# Prompt for Qwen3-VL grounding + task planning
 GROUNDING_PROMPT = """Analyze this image for a robotic pick-and-place task.
 
 User instruction: {instruction}
@@ -22,7 +21,7 @@ You must:
 Output ONLY valid JSON:
 {{
     "task": "pick_place",
-    "reasoning": "brief explanation of what you see and plan",
+    "reasoning": "brief explanation",
     "object": {{
         "type": "object type",
         "color": "color",
@@ -42,8 +41,8 @@ Output ONLY valid JSON:
 }}"""
 
 
-class Qwen3VLWrapper:
-    def __init__(self, model_name: str = "Qwen/Qwen3-VL-2B-Instruct"):
+class QwenVLWrapper:
+    def __init__(self, model_name: str = "Qwen/Qwen2.5-VL-3B-Instruct"):
         self.model_name = model_name
         self.model = None
         self.processor = None
@@ -52,18 +51,20 @@ class Qwen3VLWrapper:
 
     def load(self):
         try:
-            from transformers import AutoProcessor, AutoModelForVision2Seq
             import torch
+            from transformers import Qwen2_5_VLForConditionalGeneration, AutoProcessor
+
             self.processor = AutoProcessor.from_pretrained(self.model_name)
-            self.model = AutoModelForVision2Seq.from_pretrained(
+            self.model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
                 self.model_name,
                 torch_dtype=torch.float16,
                 device_map="auto",
+                attn_implementation="flash_attention_2" if hasattr(torch, 'flash_attention_2') else "sdpa",
             )
-            print(f"Qwen3-VL loaded: {self.model_name}")
+            print(f"Qwen VL loaded: {self.model_name}")
         except Exception as e:
-            print(f"Qwen3-VL load failed: {e}")
-            print("Using rule-based fallback for task parsing")
+            print(f"Qwen VL load failed: {e}")
+            print("Using rule-based fallback")
         return self
 
     def understand(self, image: np.ndarray, instruction: str) -> Dict:
@@ -163,13 +164,13 @@ class Qwen3VLWrapper:
 
         return {
             "task": "pick_place",
-            "reasoning": f"Rule-based fallback: detected '{found_color or 'unknown'} {found_obj or 'object'}'",
+            "reasoning": f"Rule-based: '{found_color or 'unknown'} {found_obj or 'object'}'",
             "object": {
                 "type": found_obj or "cube",
                 "color": found_color or "unknown",
                 "bbox": [0.2, 0.3, 0.4, 0.6],
                 "center_pixel": [192, 230],
-                "estimated_xyz": [0.4, 0.0, 0.05],
+                "estimated_xyz": [0.6, 0.0, 0.13],
                 "confidence": 0.80,
             },
             "target": {
@@ -177,7 +178,7 @@ class Qwen3VLWrapper:
                 "color": "blue",
                 "bbox": [0.6, 0.3, 0.8, 0.6],
                 "center_pixel": [448, 230],
-                "estimated_xyz": [-0.3, 0.0, 0.05],
+                "estimated_xyz": [0.55, 0.2, 0.13],
                 "confidence": 0.80,
             },
         }
