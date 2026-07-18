@@ -18,7 +18,7 @@ logger = logging.getLogger("robopilot")
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 os.makedirs("demo/output", exist_ok=True)
 
-N_EPISODES = 100
+N_EPISODES = 500
 
 
 def header(title):
