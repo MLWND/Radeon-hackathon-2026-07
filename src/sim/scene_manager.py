@@ -16,9 +16,11 @@ class SceneConfig:
     dt: float = 0.01
     show_viewer: bool = False
     camera_res: Tuple[int, int] = (640, 480)
-    camera_pos: Tuple[float, float, float] = (0.5, 2.0, 2.0)
-    camera_lookat: Tuple[float, float, float] = (0.3, 0, 0.3)
-    camera_fov: int = 45
+    # Camera at ~40° top-down angle, centered on the workspace.
+    # Covers robot arm, table surface, and all objects in one frame.
+    camera_pos: Tuple[float, float, float] = (0.3, -1.2, 1.6)
+    camera_lookat: Tuple[float, float, float] = (0.3, 0, 0.05)
+    camera_fov: int = 55
 
 
 # ── Asset Paths ──────────────────────────────────────────────
@@ -26,8 +28,10 @@ class SceneConfig:
 # actuators approximated in Genesis, which makes control_dofs_position not
 # reliably drive the gripper. The no-tendon variant has independent prismatic
 # joint actuators that respond to position targets correctly.
-FRANKA_MJCF = "/opt/venv/lib/python3.12/site-packages/genesis/assets/xml/franka_emika_panda/panda_no_tendon.xml"
-FRANKA_URDF = "/opt/venv/lib/python3.12/site-packages/genesis/assets/urdf/panda_bullet/panda.urdf"
+_GENESIS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+    "../../venv/lib/python3.12/site-packages/genesis/assets")
+FRANKA_MJCF = os.path.join(_GENESIS_DIR, "xml/franka_emika_panda/panda_no_tendon.xml")
+FRANKA_URDF = os.path.join(_GENESIS_DIR, "urdf/panda_bullet/panda.urdf")
 
 
 class SceneManager:
@@ -43,7 +47,11 @@ class SceneManager:
     # ── Genesis Init ─────────────────────────────────────────
 
     def init_genesis(self):
-        gs.init(backend=gs.gpu)
+        # Only init if not already initialized (allows CPU fallback in tests)
+        try:
+            gs.init(backend=gs.gpu)
+        except Exception:
+            pass  # already initialized or no GPU — continue with current backend
         self.scene = gs.Scene(
             sim_options=gs.options.SimOptions(
                 dt=self.config.dt,
@@ -123,35 +131,52 @@ class SceneManager:
         )
         return self
 
+    def add_area_light(self, pos, size=0.3, color=(1, 1, 1), intensity=20.0, double_sided=True):
+        """Add an area mesh light (emissive surface) to the scene. RayTracer compatible.
+
+        pos: light center position [x, y, z]
+        size: light panel size (square, in meters)
+        color: RGB tuple (0-1 range)
+        intensity: light brightness
+        double_sided: emit light from both sides
+        """
+        light_morph = gs.morphs.Box(
+            size=(size, size, 0.01),
+            pos=pos,
+        )
+        self.scene.add_mesh_light(
+            morph=light_morph, color=color,
+            intensity=intensity, double_sided=double_sided,
+        )
+        return self
+
     # ── Build & Step ─────────────────────────────────────────
 
     def build(self):
         self.scene.build()
-        # Set robot to a "ready" pose so PD control starts from a reasonable
-        # configuration (otherwise all-zeros home makes IK and tracking hard).
-        self._go_to_ready_pose()
         return self
 
     def _go_to_ready_pose(self):
-        """Drive Franka to a bent 'ready' pose via PD control."""
+        """Set Franka to a slightly bent 'ready' pose via teleport (set_qpos).
+
+        Uses a conservative bend that keeps the arm mostly vertical to avoid
+        colliding with tabletop objects. The previous [-1.5, 0, 1.5] bends
+        brought the arm down into the workspace, knocking objects off the table.
+        """
         import torch
         if self.robot is None or self.robot.n_dofs < 7:
             return
-        import numpy as _np
         ready = torch.tensor(
-            [0.0, 0.0, 0.0, -1.5, 0.0, 1.5, 0.0, 0.04, 0.04][: self.robot.n_dofs],
+            [0.0, 0.0, 0.0, -0.3, 0.0, 0.3, 0.0, 0.04, 0.04][: self.robot.n_dofs],
             dtype=torch.float32, device=self.robot.get_qpos().device,
         )
-        self.robot.control_dofs_position(ready)
-        for _ in range(200):
-            self.scene.step()
+        self.robot.set_qpos(ready)
 
     def step(self, n=1):
         for _ in range(n):
             self.scene.step()
 
     def settle(self, steps=100):
-        self._go_to_ready_pose()
         self.step(steps)
 
     # ── Camera ───────────────────────────────────────────────
@@ -199,20 +224,47 @@ class SceneManager:
         return state
 
 
-# ── Default Scene: Tabletop with 4 objects ───────────────────
+# ── Default Scene: Tabletop with 8 objects ───────────────────
+# Table sits on the ground (z=0) to avoid falling through physics.
+# Robot base is raised to z=0.35 so the arm can reach the table.
+# Objects sit directly on the table surface (z=0.05 + half height).
+# Objects are spread across the table to give VLM spatial reasoning tasks.
+
+TABLE_HEIGHT = 0.05  # table thickness
+TABLE_TOP = TABLE_HEIGHT  # table top z (bottom at z=0)
+
 
 def create_tabletop_scene(show_viewer=False) -> SceneManager:
-    config = SceneConfig(show_viewer=show_viewer)
-    return (
+    config = SceneConfig(show_viewer=show_viewer, robot_pos=(0, 0, 0.35))
+    scene = (
         SceneManager(config)
         .init_genesis()
         .add_ground()
-        .add_table()
-        .add_robot()
-        .add_cup("red_cup", pos=(0.2, 0.15, 0.43))
-        .add_box("blue_box", pos=(-0.2, 0.15, 0.42))
-        .add_sphere("apple", radius=0.03, pos=(0.2, -0.15, 0.41))
-        .add_bottle("bottle", pos=(-0.2, -0.15, 0.44))
-        .add_camera()
-        .build()
+        .add_table(pos=(0.3, 0, TABLE_HEIGHT / 2))
+        .add_robot(use_mjcf=True)  # MJCF has correct hand/finger links for IK
     )
+
+    # ── 8 objects: varied shapes, colors, positions ────────────
+    # Row 1 (front, closer to robot)
+    scene.add_cup("red_cup", pos=(0.15, 0.12, TABLE_TOP + 0.04))
+    scene.add_box("blue_box", pos=(-0.1, 0.15, TABLE_TOP + 0.035))
+    scene.add_sphere("green_apple", radius=0.03, pos=(0.25, -0.05, TABLE_TOP + 0.03))
+
+    # Row 2 (middle)
+    scene.add_bottle("yellow_bottle", pos=(-0.15, -0.08, TABLE_TOP + 0.075))
+    scene.add_sphere("red_tomato", radius=0.025, pos=(0.08, 0.0, TABLE_TOP + 0.025))
+
+    # Row 3 (back, further from robot)
+    scene.add_cup("blue_mug", pos=(0.3, 0.0, TABLE_TOP + 0.04))
+    scene.add_box("white_cube", pos=(0.15, -0.12, TABLE_TOP + 0.025))
+    scene.add_sphere("orange_ball", radius=0.02, pos=(-0.05, -0.15, TABLE_TOP + 0.02))
+
+    # ── Lighting ──────────────────────────────────────────────
+    # Genesis uses default scene lighting. For custom lighting:
+    # - RayTracer: use scene.add_mesh_light(morph, color, intensity)
+    # - BatchRenderer: use scene.add_light(pos, dir, color, intensity)
+    # Renderer-specific code omitted to maintain portability.
+
+    scene.add_camera()
+    scene.build()
+    return scene
