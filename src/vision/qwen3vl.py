@@ -1,6 +1,8 @@
 """
 Qwen3-VL Perception Module
-Uses native Qwen3VLForConditionalGeneration from transformers>=4.57.
+Uses native Qwen3VLForConditionalGeneration.
+Outputs relative spatial descriptions, not absolute coordinates.
+Scene memory resolves to precise Genesis coordinates.
 """
 import numpy as np
 import json
@@ -8,20 +10,25 @@ import time
 from typing import Dict, Optional, List
 
 
-GROUNDING_PROMPT = """Analyze this image for a robotic pick-and-place task.
+GROUNDING_PROMPT = """You are a robot vision system analyzing a tabletop scene.
 
-Instruction: {instruction}
+User instruction: {instruction}
 
-You must identify:
-1. The object to pick (name from: {objects})
-2. Where to place it (coordinates on the table, x in [0.3,0.8], y in [-0.3,0.3])
+Available objects and their approximate positions:
+{object_list}
+
+Determine:
+1. Which object to PICK (name from the list above)
+2. WHERE to PLACE it — describe relative to another object or table area
 
 Output ONLY valid JSON:
 {{
     "pick": "object_name",
-    "place_xyz": [x, y, z],
+    "place_relative": "description like 'right of blue_cube' or 'center of table'",
     "reasoning": "brief explanation"
-}}"""
+}}
+
+Do NOT output coordinates — the system will compute exact positions."""
 
 
 class QwenVLWrapper:
@@ -30,7 +37,6 @@ class QwenVLWrapper:
         self.model = None
         self.processor = None
         self.last_inference_time = 0.0
-        self.last_output = None
 
     def load(self):
         try:
@@ -48,17 +54,13 @@ class QwenVLWrapper:
             print(f"Qwen3-VL load failed: {e}")
         return self
 
-    def understand(self, image: np.ndarray, instruction: str,
-                   objects: list, table_top: float = 0.05) -> Dict:
+    def understand(self, image, instruction, objects: dict, table_top=0.05):
         start = time.time()
-
         if self.model is not None:
             result = self._inference(image, instruction, objects, table_top)
         else:
             result = self._rule_based(instruction, objects, table_top)
-
         self.last_inference_time = (time.time() - start) * 1000
-        self.last_output = result
         return result
 
     def _inference(self, image, instruction, objects, table_top):
@@ -66,9 +68,17 @@ class QwenVLWrapper:
         import torch
 
         pil_img = Image.fromarray(image)
+
+        # Build object list with positions
+        obj_lines = []
+        for name, ent in objects.items():
+            pos = ent.get_pos().cpu().numpy()
+            obj_lines.append(f"  - {name}: at [{pos[0]:.2f}, {pos[1]:.2f}, z={pos[2]:.2f}]")
+        obj_list_str = "\n".join(obj_lines)
+
         prompt = GROUNDING_PROMPT.format(
             instruction=instruction,
-            objects=", ".join(objects),
+            object_list=obj_list_str,
         )
 
         messages = [{"role": "user", "content": [
@@ -77,53 +87,80 @@ class QwenVLWrapper:
         ]}]
 
         text = self.processor.apply_chat_template(
-            messages, tokenize=False, add_generation_prompt=True
-        )
+            messages, tokenize=False, add_generation_prompt=True)
         inputs = self.processor(
             text=[text], images=[pil_img], return_tensors="pt"
         ).to(self.model.device)
 
         with torch.no_grad():
             output = self.model.generate(
-                **inputs, max_new_tokens=256, do_sample=False,
-            )
+                **inputs, max_new_tokens=256, do_sample=False)
 
         response = self.processor.decode(output[0], skip_special_tokens=True)
-        return self._parse_response(response, objects, table_top)
+        return self._parse(response, objects, table_top)
 
-    def _parse_response(self, response, objects, table_top):
+    def _parse(self, response, objects, table_top):
         try:
-            start = response.find("{")
-            end = response.rfind("}") + 1
-            if start >= 0 and end > start:
-                result = json.loads(response[start:end])
-                pick = result.get("pick", "")
-                place = result.get("place_xyz", [0.75, 0.2, table_top + 0.02])
-                if pick not in objects:
-                    pick = objects[0] if objects else "red_cube"
-                return {
-                    "pick": pick,
-                    "place_xyz": place,
-                    "reasoning": result.get("reasoning", ""),
-                }
-        except json.JSONDecodeError:
-            pass
-        return self._rule_based(response, objects, table_top)
+            s = response.rfind("```json")
+            e = response.rfind("```")
+            block = response[s+7:e].strip() if s >= 0 and e > s else response[response.find("{"):response.rfind("}")+1]
+            r = json.loads(block)
+            pick = r.get("pick", "")
+            if pick not in objects:
+                pick = list(objects.keys())[0] if objects else "red_cube"
+            return {
+                "pick": pick,
+                "place_relative": r.get("place_relative", "right of the scene"),
+                "reasoning": r.get("reasoning", ""),
+            }
+        except Exception:
+            return self._rule_based(response, objects, table_top)
 
     def _rule_based(self, instruction, objects, table_top):
         lower = instruction.lower()
-        pick = objects[0] if objects else "red_cube"
+        pick = list(objects.keys())[0] if objects else "red_cube"
         for name in objects:
-            color = name.split("_")[0]
-            if color in lower:
+            if name.split("_")[0] in lower:
                 pick = name
                 break
-        place_xyz = [0.75, 0.2, table_top + 0.02]
         return {
             "pick": pick,
-            "place_xyz": place_xyz,
-            "reasoning": f"Rule-based fallback: pick {pick}",
+            "place_relative": "right of the scene",
+            "reasoning": "Rule-based fallback",
         }
 
     def get_inference_time(self):
         return self.last_inference_time
+
+
+def resolve_place_position(place_relative: str, objects: dict, table_top=0.05, cube_size=0.04):
+    """Convert relative description to exact Genesis coordinates.
+
+    Uses scene memory (object positions) for precise placement.
+    """
+    lower = place_relative.lower()
+
+    # Try to find a reference object
+    ref_name = None
+    for name in objects:
+        if name in lower:
+            ref_name = name
+            break
+
+    if ref_name and ref_name in objects:
+        ref_pos = objects[ref_name].get_pos().cpu().numpy()
+        # Place next to reference object
+        if "right" in lower or "east" in lower:
+            return [ref_pos[0] + 0.1, ref_pos[1], table_top + cube_size / 2]
+        elif "left" in lower or "west" in lower:
+            return [ref_pos[0] - 0.1, ref_pos[1], table_top + cube_size / 2]
+        elif "behind" in lower or "north" in lower:
+            return [ref_pos[0], ref_pos[1] + 0.1, table_top + cube_size / 2]
+        elif "front" in lower or "south" in lower:
+            return [ref_pos[0], ref_pos[1] - 0.1, table_top + cube_size / 2]
+        else:
+            # Default: place to the right of reference
+            return [ref_pos[0] + 0.1, ref_pos[1], table_top + cube_size / 2]
+
+    # Default: center of table
+    return [0.55, 0.0, table_top + cube_size / 2]
