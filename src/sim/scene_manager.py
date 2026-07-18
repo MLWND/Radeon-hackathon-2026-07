@@ -46,9 +46,12 @@ class SceneManager:
     def init_genesis(self):
         # Only init if not already initialized (allows CPU fallback in tests)
         try:
-            gs.init(backend=gs.gpu)
+            gs.init(backend=gs.amdgpu)
         except Exception:
-            pass  # already initialized or no GPU — continue with current backend
+            try:
+                gs.init(backend=gs.gpu)
+            except Exception:
+                pass  # already initialized — continue with current backend
         self.scene = gs.Scene(
             sim_options=gs.options.SimOptions(
                 dt=self.config.dt,
@@ -221,20 +224,21 @@ def create_tabletop_scene(show_viewer=False) -> SceneManager:
         SceneManager(config)
         .init_genesis()
         .add_ground()
-        .add_robot(use_mjcf=True)  # MJCF panda.xml for OMPL compatibility
+        .add_table(size=(0.8, 1.0, 0.05), pos=(0.5, 0, 0.025))
+        .add_robot(use_mjcf=True)
     )
 
-    # ── 8 objects on ground plane ─────────────────────────────
-    # Objects placed in safe zone (x ≥ 0.45) to avoid robot collision zone.
-    # No table — objects rest on ground plane for reliable physics and OMPL planning.
-    scene.add_cup("red_cup", pos=(0.55, 0.0, 0.04))
-    scene.add_box("blue_box", pos=(0.45, 0.2, 0.035))
-    scene.add_sphere("green_apple", radius=0.03, pos=(0.6, -0.1, 0.03))
-    scene.add_bottle("yellow_bottle", pos=(0.4, -0.15, 0.075))
-    scene.add_sphere("red_tomato", radius=0.025, pos=(0.5, 0.1, 0.025))
-    scene.add_cup("blue_mug", pos=(0.6, 0.15, 0.04))
-    scene.add_box("white_cube", pos=(0.45, -0.1, 0.025))
-    scene.add_sphere("orange_ball", radius=0.02, pos=(0.55, -0.15, 0.02))
+    # 8 objects on Kinematic table. Table top at z=0.05.
+    # Objects at x >= 0.55 to stay clear of robot base collision zone.
+    table_top = 0.05
+    scene.add_cup("red_cup", pos=(0.6, 0.0, table_top + 0.04))
+    scene.add_box("blue_box", pos=(0.55, 0.2, table_top + 0.035))
+    scene.add_sphere("green_apple", radius=0.03, pos=(0.7, -0.1, table_top + 0.03))
+    scene.add_bottle("yellow_bottle", pos=(0.6, -0.2, table_top + 0.075))
+    scene.add_sphere("red_tomato", radius=0.025, pos=(0.65, 0.1, table_top + 0.025))
+    scene.add_cup("blue_mug", pos=(0.75, 0.15, table_top + 0.04))
+    scene.add_box("white_cube", pos=(0.55, -0.1, table_top + 0.025))
+    scene.add_sphere("orange_ball", radius=0.02, pos=(0.7, -0.15, table_top + 0.02))
 
     scene.add_camera()
     scene.build()
