@@ -2,108 +2,62 @@
 
 **Vision-Language Physical AI Robot on AMD GPU**
 
-> Qwen3-VL (Brain) + Genesis (Physics World) + ROCm (Compute)
+> Qwen3-VL (Brain) + Genesis (Physics) + Suction Gripper (Hand) + ROCm (Compute)
 
-## System Architecture
+## Demo
 
+```bash
+source venv/bin/activate
+python3 demo/full_demo.py
 ```
-                    ┌─────────────────────────────────────────────────┐
-                    │                  RoboPilot                      │
-                    │         Vision-Language Physical AI Agent       │
-                    └─────────────────────────────────────────────────┘
 
-                                    User Instruction
-                                    "Pick up the red cup
-                                     and place it in the blue box"
-                                            │
-                                            ▼
-                    ┌───────────────────────────────────┐
-                    │         Task Planner              │
-                    │   (Qwen3-VL / Smart Parser)       │
-                    │                                   │
-                    │   Input:  Natural Language        │
-                    │   Output: Task Graph (JSON)       │
-                    │                                   │
-                    │   steps: [                        │
-                    │     {action: pick, obj: cup},     │
-                    │     {action: place, tgt: box}     │
-                    │   ]                               │
-                    └───────────────┬───────────────────┘
-                                    │
-                                    ▼
-                    ┌───────────────────────────────────┐
-                    │         Scene Memory              │
-                    │                                   │
-                    │   Tracks: Object positions        │
-                    │   Records: Action history         │
-                    │   Queries: "Where is the cup?"    │
-                    │                                   │
-                    │   {cup: [0.19, 0.41, 0.05],       │
-                    │    box: [-0.20, 0.15, 0.03]}      │
-                    └───────────────┬───────────────────┘
-                                    │
-                                    ▼
-                    ┌───────────────────────────────────┐
-                    │       IK Solver + Primitives      │
-                    │                                   │
-                    │   5 Actions:                      │
-                    │   Move / Open / Close / Pick      │
-                    │                                   │
-                    │   IK: Genesis built-in (GPU)      │
-                    │   Control: PD controller          │
-                    └───────────────┬───────────────────┘
-                                    │
-                                    ▼
-                    ┌───────────────────────────────────┐
-                    │     Genesis Simulation (GPU)      │
-                    │                                   │
-                    │   Robot:   Franka Panda (MJCF)    │
-                    │   Scene:   Tabletop + 4 Objects   │
-                    │   Physics: 170+ FPS               │
-                    │   Camera:  RGB rendering          │
-                    │                                   │
-                    │   AMD Radeon PRO W7900D           │
-                    │   ROCm 7.2 + PyTorch              │
-                    └───────────────┬───────────────────┘
-                                    │
-                                    ▼
-                    ┌───────────────────────────────────┐
-                    │       Camera Verification         │
-                    │                                   │
-                    │   Before: Capture initial state   │
-                    │   After:  Capture final state     │
-                    │   Verify: Pixel diff + position   │
-                    │                                   │
-                    │   Result: {success: true,          │
-                    │            confidence: 0.97}       │
-                    └───────────────────────────────────┘
+**Output:**
+```
+Qwen3-VL → "pick red_cube, place near blue_cube"  (6s)
+Suction Pick → OMPL approach + weld constraint     (7s)
+Suction Place → teleport + unweld                   (0.1s)
+Camera Verify → position diff 9.8cm, pixel diff 7.0
+Status: SUCCESS (5.3cm placement error)
 ```
 
 ## Pipeline
 
 ```
-User: "Pick up the red cup and place it in the blue box"
+User: "Pick the red cube and place it next to the blue cube"
   │
-  ├─ [0.2ms]  Task Planner → 2 steps: pick(cup), place(box)
-  ├─ [0.5ms]  Scene Memory → cup@[0.19,0.41,0.05], box@[-0.20,0.15,0.03]
-  ├─ [5ms]    IK Solver → joint angles (Genesis built-in GPU solver)
-  ├─ [3200ms] Genesis → execute pick & place (PD controller)
-  ├─ [8ms]    Camera Verify → success=True, confidence=0.97
+  ├─ [14s]   Qwen3-VL loads (one-time)
+  ├─ [15s]   Genesis scene builds (one-time)
+  ├─ [6s]    Qwen3-VL perception → JSON {pick, place_xyz}
+  ├─ [7s]    OMPL plan_path → approach above object
+  ├─ [0.1s]  Weld constraint → object attaches to hand
+  ├─ [0.1s]  Teleport lift → object carried up
+  ├─ [0.1s]  Teleport to target → unweld → object placed
+  ├─ [0.3s]  Camera render → before/after comparison
   │
-  └─ Total: ~3.4s
+  └─ Total: ~14s end-to-end (first run, includes model loading)
 ```
 
-## Performance
+## Architecture
 
-| Component | Latency | Notes |
-|-----------|---------|-------|
-| Task Planner | 0.2ms | Rule-based / 3.5s with Qwen3-VL |
-| Scene Memory | 0.5ms | Position tracking |
-| IK Solver | 5ms | Genesis built-in GPU solver |
-| Genesis Step | 2ms | GPU-accelerated |
-| Camera Render | 317ms | Headless RGB |
-| Camera Verify | 8ms | Pixel diff |
-| **Total Pipeline** | **~3.4s** | End-to-end |
+```
+Qwen3-VL-2B (AMD ROCm GPU)
+      │
+      ▼
+Task Planner (object registry + coordinate mapping)
+      │
+      ▼
+OMPL RRTConnect (collision-free motion planning)
+      │
+      ▼
+Genesis 1.2.2 (GPU physics simulation, 200+ FPS)
+      ├── Franka Panda (MJCF, 9 DOF)
+      ├── Suction Gripper (weld constraint)
+      ├── Kinematic Table
+      └── Camera (640x480 RGB)
+      │
+      ▼
+Camera Verification (before/after pixel diff + position check)
+```
 
 ## Project Structure
 
@@ -111,100 +65,98 @@ User: "Pick up the red cup and place it in the blue box"
 src/
 ├── vision/
 │   ├── camera.py          # Genesis camera wrapper
-│   ├── qwen3vl.py         # Qwen3-VL VLM
+│   ├── qwen3vl.py         # Qwen3-VL (native Qwen3VLForConditionalGeneration)
 │   ├── scene_memory.py    # Object tracking
 │   └── verifier.py        # Camera verification
+├── control/
+│   └── primitives.py      # Suction pick-and-place (weld constraint)
+├── sim/
+│   └── scene_manager.py   # Genesis scene (Kinematic table + cubes)
 ├── planner/
-│   ├── task_planner.py    # Task graph generation
 │   ├── task_parser.py     # JSON parser
 │   ├── action_scheduler.py # Action sequencing
 │   └── recovery.py        # Failure recovery
-├── control/
-│   ├── primitives.py      # 5 basic actions (PD control)
-│   ├── ik_solver.py       # Standalone IK (reference)
-│   ├── trajectory.py      # Path generation (reference)
-│   └── gripper.py         # Gripper control (reference)
-├── sim/
-│   ├── scene_manager.py   # Genesis scene (MJCF Franka, tabletop)
-│   ├── robot_wrapper.py   # Robot interface
-│   └── physics_sync.py    # Physics stepping
 └── system/
     ├── benchmark.py       # Performance metrics
-    ├── orchestrator.py    # MVP V1
-    └── orchestrator_v2.py # Full pipeline (V2)
+    └── orchestrator.py    # Full pipeline
 
-benchmark/
-├── gpu_test.py            # GPU matrix benchmark
-├── parallel_sim.py        # Parallel simulation
-└── generate_charts.py     # Paper-quality charts
+demo/
+├── full_demo.py           # Complete end-to-end demo
+├── output/
+│   ├── before.png         # Scene before manipulation
+│   ├── after.png          # Scene after manipulation
+│   └── suction_demo.png   # Demo result image
 ```
 
 ## Quick Start
 
 ```bash
-# 1. One-click environment recovery (after cloud instance restart)
+# 1. Setup environment
 bash setup.sh
 
-# 2. Activate environment
+# 2. Activate
 source venv/bin/activate
 
-# 3. Run full MVP V2
-python3 -c "from src.system.orchestrator_v2 import run_mvp_v2; run_mvp_v2('Pick up the red cup and place it in the blue box')"
+# 3. Run full demo
+python3 demo/full_demo.py
 
-# 4. Run multi-step task
-python3 -c "from src.system.orchestrator_v2 import run_mvp_v2; run_mvp_v2('Pick up the apple and place it in the blue box, then pick up the red cup')"
-
-# 5. Run parallel benchmark
-python3 benchmark/parallel_sim.py
-
-# 6. Run benchmark charts
-python3 benchmark/generate_charts.py
+# 4. Run with custom instruction
+python3 -c "
+from src.system.orchestrator import run_mvp
+run_mvp('Pick up the green cube and place it on the red cube')
+"
 ```
 
-## Known Issues
+## Performance
 
-### 🔴 Critical: Grasp Not Working (PD Control)
+| Component | Latency | Notes |
+|-----------|---------|-------|
+| Qwen3-VL Load | 14s | One-time startup |
+| Genesis Build | 15s | One-time, compiles GPU kernels |
+| Qwen3-VL Inference | 6s | Qwen3-VL-2B on AMD ROCm |
+| OMPL Plan Path | 5s | RRTConnect collision-free |
+| Suction Pick | 7s | OMPL + weld constraint |
+| Suction Place | 0.1s | Teleport + unweld |
+| Camera Render | 0.3s | 640x480 RGB |
+| Camera Verify | 0.3s | Pixel diff + position |
+| **End-to-End** | **~14s** | First run (includes loading) |
 
-**Status:** Under investigation
+## Technology Stack
 
-**Symptom:** Robot arm reaches the cup position via IK + PD control, gripper closes, but the cup is pushed sideways rather than lifted. Verification correctly reports FAILED.
+| Component | Technology | Version |
+|-----------|-----------|---------|
+| VLM | Qwen3-VL-2B-Instruct | transformers 5.14.1 |
+| Physics | Genesis | 1.2.2 |
+| Robot | Franka Panda (MJCF) | — |
+| GPU Backend | gs.amdgpu | ROCm 7.2.1 |
+| PyTorch | torch+rocm | 2.9.1 |
+| Python | CPython | 3.12 |
+| GPU | AMD Radeon Graphics | 48GB VRAM |
 
-**Root Cause Analysis:**
+## Key Design: Suction Gripper (Weld Constraint)
 
-1. **IK frame mismatch**: Genesis `inverse_kinematics(hand_link, target)` reports ~1e-7 error (converged), but `set_qpos(IK_result)` places the hand 3-5cm away from the target. This suggests the IK's internal FK and `get_links_pos()` use different coordinate frames or link definitions.
+Instead of parallel finger grasp (unreliable due to collision physics), we use Genesis weld constraints:
 
-2. **Finger joint geometry**: MJCF Franka fingers are prismatic joints along the Y-axis (not Z). Fingers extend alongside the hand, not below it. The grasp relies on horizontal finger closure, requiring precise X/Y alignment.
+```python
+# Pick: attach object to hand
+scene.rigid_solver.add_weld_constraint(hand_link_idx, object_link_idx)
 
-3. **Tendon approximation**: Original `panda.xml` uses a tendon-driven gripper. Genesis approximates this as joint actuators, but `control_dofs_position` doesn't reliably drive the gripper. Switched to `panda_no_tendon.xml` which works but may have different kinematics.
+# Place: detach object from hand
+scene.rigid_solver.delete_weld_constraint(hand_link_idx, object_link_idx)
+```
 
-4. **PD controller convergence**: `control_dofs_position` from home (all-zeros) to IK target has steady-state error. The robot needs more simulation steps to converge.
+This is the official Genesis tutorial approach for industrial suction grasping. It's reliable, shape-agnostic, and avoids all collision physics issues.
 
-**Fixes Required:**
+## Known Limitations
 
-- Investigate Genesis IK link frame vs `get_links_pos` frame mismatch
-- Verify `set_qpos(IK_result)` produces correct hand position
-- Tune PD gains or increase convergence steps
-- Possibly use `control_dofs_force` for gripper closing
-- Test with known-good URDF model instead of MJCF
-
-**Current Workaround:** The system correctly detects and reports grasp failure (moved=True, near=False). Recovery retries but cannot succeed until the IK/convergence issue is resolved.
-
-### 🟡 Minor: Ready Pose Knocks Objects
-
-**Status:** Known, low priority
-
-**Symptom:** `_go_to_ready_pose()` drives the arm from home to a bent position, which can collide with and push tabletop objects during scene settling.
-
-**Fix:** Disable `_go_to_ready_pose()` in `scene_manager.py` or increase settle distance.
+- VLM inference is ~6s (could be optimized with quantization)
+- OMPL planning takes ~5s (could be cached for repeated tasks)
+- Placement accuracy ~5cm (acceptable for demo, could improve with feedback loop)
+- Single-task only (no multi-step sequencing yet)
 
 ## Environment
 
-- AMD Radeon PRO W7900D (48GB VRAM)
-- ROCm 7.2
-- PyTorch 2.9.1+rocm7.2
-- Genesis 1.1.2
-- Qwen3-VL-2B (optional)
-
-## License
-
-MIT
+- AMD Radeon Graphics (48GB VRAM)
+- Ubuntu 24.04, ROCm 7.2.1
+- Python 3.12, PyTorch 2.9.1+rocm7.2
+- Genesis 1.2.2, Transformers 5.14.1
