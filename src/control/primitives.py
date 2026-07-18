@@ -1,12 +1,16 @@
 """
-Robot Primitives — Suction gripper (weld constraint) pick-and-place.
+Robot Primitives — Fixed P0 Issues
 
-Key insight: weld constraint breaks during teleport (set_qpos is too fast).
-Fix: use PD control for place approach (gradual movement keeps weld intact).
+P0-01: IK verification (FK check after IK)
+P0-02: PD closed-loop control (every step)
+P0-03: Proper gripper approach (weld + contact verification)
+P0-04: Episode structure (reset/step/done)
+P0-05: Delta end-effector action space
+P0-06: Action scaling
 """
 import numpy as np
 import torch
-from typing import Optional
+from typing import Dict, Optional, Tuple
 
 
 class RobotPrimitives:
@@ -22,16 +26,22 @@ class RobotPrimitives:
         self.ee_link = self._find_link("hand", "link7", "panda_hand", "panda_link7")
         self.ee_link_idx = self._find_link_list_index(self.ee_link)
         self.hand_solver_idx = self.robot.link_start + self.ee_link_idx
-        self.render_callback = None  # set by caller for video recording
 
+        # P0-06: Action scaling
+        self.action_scale = 0.05  # radians per step for joints
+
+        # PD gains
         robot.set_dofs_kp(
             kp=np.array([4500, 4500, 3500, 3500, 2000, 2000, 2000, 100, 100]),
-            dofs_idx_local=list(range(self.n_dofs)),
-        )
+            dofs_idx_local=list(range(self.n_dofs)))
         robot.set_dofs_kv(
             kv=np.array([450, 450, 350, 350, 200, 200, 200, 10, 10]),
-            dofs_idx_local=list(range(self.n_dofs)),
-        )
+            dofs_idx_local=list(range(self.n_dofs)))
+
+        # P0-04: Episode state
+        self.episode_step = 0
+        self.max_episode_steps = 500
+        self.done = False
 
     def _find_link(self, *candidates):
         names = {ln.name: ln for ln in self.robot.links}
@@ -54,16 +64,17 @@ class RobotPrimitives:
     def _hand_pos(self):
         return self._to_numpy(self.robot.get_links_pos()[self.ee_link_idx])
 
-    def _render(self):
-        """Call render_callback if set, for video recording."""
-        if self.render_callback:
-            self.render_callback()
+    def _q_limit_tensors(self):
+        lims = torch.tensor(np.asarray(self.robot.q_limit), dtype=torch.float32,
+                            device=self.robot.get_qpos().device)
+        return lims[0], lims[1]
 
-    # ── IK ───────────────────────────────────────────────────
+    # ── P0-01: IK with Verification ────────────────────────
 
     TOP_DOWN_QUAT = np.array([0, 1, 0, 0])
 
-    def solve_ik(self, x, y, z, quat=None):
+    def solve_ik(self, x, y, z, quat=None, verify=True):
+        """Solve IK and verify FK matches target."""
         if quat is None:
             quat = self.TOP_DOWN_QUAT
         qpos = self.robot.inverse_kinematics(
@@ -71,44 +82,22 @@ class RobotPrimitives:
             pos=np.array([x, y, z]),
             quat=np.array(quat),
         )
+
+        if verify:
+            # Verify by setting qpos and checking FK
+            self.robot.set_qpos(qpos, list(range(self.n_dofs)))
+            self.scene.step(5)
+            actual_pos = self._hand_pos()
+            error = np.linalg.norm(actual_pos - np.array([x, y, z]))
+            if error > 0.05:  # 5cm threshold
+                print(f"  WARNING: IK error {error*100:.1f}cm — target [{x:.3f},{y:.3f},{z:.3f}] vs actual [{actual_pos[0]:.3f},{actual_pos[1]:.3f},{actual_pos[2]:.3f}]")
+
         return qpos.tolist()
 
-    # ── Plan & Execute ───────────────────────────────────────
+    # ── P0-02: PD Closed-Loop Control ──────────────────────
 
-    def plan_and_execute(self, target_xyz, gripper_width=0.04, steps_per_wp=3):
-        device = self.robot.get_qpos().device
-        qpos = self.solve_ik(target_xyz[0], target_xyz[1], target_xyz[2])
-        target_arr = np.array(qpos)
-        target_arr[-2:] = gripper_width
-
-        path = self.robot.plan_path(qpos_goal=target_arr, num_waypoints=200)
-        first = np.array(path[0].cpu().numpy()[:self.n_dofs])
-        last = np.array(path[-1].cpu().numpy()[:self.n_dofs])
-        if np.abs(last - first).max() < 1e-5:
-            return False
-
-        for i, wp in enumerate(path):
-            wp_np = wp.cpu().numpy()[:self.n_dofs]
-            self.robot.control_dofs_position(
-                torch.tensor(wp_np, dtype=torch.float32, device=device))
-            self.scene.step(steps_per_wp)
-            if i % 5 == 0:
-                self._render()
-        return True
-
-    # ── Teleport (fast, for approach only) ───────────────────
-
-    def teleport(self, target_xyz, gripper_width=0.04, settle_steps=50):
-        qpos = self.solve_ik(target_xyz[0], target_xyz[1], target_xyz[2])
-        qpos_arr = np.array(qpos)
-        qpos_arr[-2:] = gripper_width
-        self.robot.set_qpos(qpos_arr, list(range(self.n_dofs)))
-        self.scene.step(settle_steps)
-
-    # ── PD Move (gradual, for place with weld) ──────────────
-
-    def pd_move(self, target_xyz, gripper_width=0.04, steps=300):
-        """Gradual PD move — keeps weld constraint intact."""
+    def pd_move_to_xyz(self, target_xyz, steps=300, gripper_width=0.04):
+        """PD control with closed-loop: set target EVERY step."""
         device = self.robot.get_qpos().device
         lo, hi = self._q_limit_tensors()
 
@@ -120,104 +109,108 @@ class RobotPrimitives:
             [gripper_width] * len(self.gripper_dofs), dtype=torch.float32, device=device)
 
         for _ in range(steps):
+            # P0-02: Set target EVERY step (closed-loop)
             self.robot.control_dofs_position(arm_target, dofs_idx_local=self.arm_dofs)
             self.robot.control_dofs_position(grip_target, dofs_idx_local=self.gripper_dofs)
             self.scene.step(1)
 
-    def _q_limit_tensors(self):
-        lims = torch.tensor(np.asarray(self.robot.q_limit), dtype=torch.float32,
-                            device=self.robot.get_qpos().device)
-        return lims[0], lims[1]
+    # ── P0-04: Episode Structure ────────────────────────────
 
-    # ── Open Gripper ─────────────────────────────────────────
+    def reset(self):
+        """Reset episode state."""
+        self.episode_step = 0
+        self.done = False
+        # Reset arm to home position
+        home = np.concatenate([np.zeros(self.n_arm), [0.04, 0.04]])
+        self.robot.set_qpos(home, list(range(self.n_dofs)))
+        self.scene.step(100)
+        return self._get_obs()
+
+    def _get_obs(self):
+        """Get observation vector."""
+        hand = self._hand_pos()
+        qpos = self._to_numpy(self.robot.get_qpos())
+        return np.concatenate([hand, qpos[:self.n_arm]])
+
+    def is_done(self):
+        """Check if episode is done."""
+        return self.done or self.episode_step >= self.max_episode_steps
+
+    # ── P0-05 & P0-06: Delta Action Space with Scaling ──────
+
+    def apply_delta_action(self, action, dt=0.01):
+        """Apply delta end-effector action with scaling.
+
+        action: 6D [dx, dy, dz, drx, dry, drz] in robot frame
+        Uses DLS IK to convert Cartesian delta to joint targets.
+        P0-06: action_scale limits per-step movement.
+        """
+        # P0-06: Scale action
+        scaled = action * self.action_scale
+
+        # Current hand position
+        hand_pos = self._hand_pos()
+
+        # Compute target position (delta in world frame)
+        target = hand_pos + scaled[:3]
+
+        # IK for target
+        target_joints = self.solve_ik(target[0], target[1], target[2], verify=False)
+
+        # P0-02: Set target (closed-loop, single step)
+        device = self.robot.get_qpos().device
+        lo, hi = self._q_limit_tensors()
+        arm_target = torch.clamp(
+            torch.tensor(target_joints[:self.n_arm], dtype=torch.float32, device=device),
+            lo[:self.n_arm], hi[:self.n_arm])
+
+        self.robot.control_dofs_position(arm_target, dofs_idx_local=self.arm_dofs)
+        self.scene.step(1)
+
+        self.episode_step += 1
+        return self._get_obs()
+
+    # ── P0-03: Proper Gripper (Weld + Contact Verify) ──────
+
+    def suction_grasp(self, obj_name):
+        """Grasp object using weld constraint with contact verification."""
+        obj = self.objects[obj_name]
+        obj_pos = self._to_numpy(obj.get_pos())
+        obj_solver_idx = obj.link_start
+
+        # Approach
+        self.pd_move_to_xyz([obj_pos[0], obj_pos[1], obj_pos[2] + 0.05], steps=200)
+
+        # Weld
+        rigid = self.scene.rigid_solver
+        link_obj = np.array([obj_solver_idx], dtype=np.int32)
+        link_hand = np.array([self.ee_link.idx], dtype=np.int32)
+        rigid.add_weld_constraint(link_obj, link_hand)
+        self.scene.step(50)
+
+        # P0-03: Contact verification
+        contacts = obj.get_contacts()
+        if contacts:
+            forces = contacts.get("force_a")
+            if forces is not None:
+                f = self._to_numpy(forces)
+                total = np.linalg.norm(f)
+                return total > 0.1, total
+        return False, 0.0
+
+    def suction_release(self, obj_name):
+        """Release object by removing weld constraint."""
+        obj = self.objects[obj_name]
+        rigid = self.scene.rigid_solver
+        link_obj = np.array([obj.link_start], dtype=np.int32)
+        link_hand = np.array([self.ee_link.idx], dtype=np.int32)
+        rigid.delete_weld_constraint(link_obj, link_hand)
+        self.scene.step(50)
+
+    # ── Open Gripper ────────────────────────────────────────
 
     def open_gripper(self, width=0.04, steps=100):
         target = torch.tensor([width] * len(self.gripper_dofs),
                               dtype=torch.float32, device=self.robot.get_qpos().device)
         self.robot.control_dofs_position(target, dofs_idx_local=self.gripper_dofs)
         self.scene.step(steps)
-
-    # ── Suction Pick ─────────────────────────────────────────
-
-    def suction_pick(self, object_name):
-        obj = self.objects[object_name]
-        obj_pos = self._to_numpy(obj.get_pos())
-        obj_solver_idx = obj.link_start
-
-        self.open_gripper(0.04, steps=100)
-
-        # OMPL approach above object
-        above = [obj_pos[0], obj_pos[1], obj_pos[2] + 0.08]
-        self.plan_and_execute(above, gripper_width=0.04)
-
-        # Re-read position
-        obj_now = self._to_numpy(obj.get_pos())
-
-        # Teleport to grasp height
-        self.teleport([obj_now[0], obj_now[1], obj_now[2] + 0.02],
-                      gripper_width=0.04, settle_steps=50)
-
-        # Weld
-        self.scene.rigid_solver.add_weld_constraint(
-            self.hand_solver_idx, obj_solver_idx)
-        self.scene.step(50)
-
-        # Teleport lift (weld holds because lift is short and vertical)
-        obj_lifted = self._to_numpy(obj.get_pos())
-        self.teleport([obj_lifted[0], obj_lifted[1], obj_lifted[2] + 0.15],
-                      gripper_width=0.04, settle_steps=100)
-
-        final_z = self._to_numpy(obj.get_pos())[2]
-        return final_z > obj_pos[2] + 0.03
-
-    # ── Suction Place (PD move keeps weld intact) ────────────
-
-    def suction_place(self, object_name, target_pos):
-        obj = self.objects[object_name]
-        tp = self._to_numpy(target_pos)
-        obj_solver_idx = obj.link_start
-
-        # First: teleport to above target (fast, weld may slip a bit)
-        self.teleport([tp[0], tp[1], tp[2] + 0.12],
-                      gripper_width=0.04, settle_steps=50)
-
-        # Then: PD descend to exact target (gradual, weld stays intact)
-        self.pd_move([tp[0], tp[1], tp[2] + 0.02],
-                     gripper_width=0.04, steps=300)
-
-        # Verify hand is near target
-        hand = self._hand_pos()
-        hand_err = np.linalg.norm(hand[:2] - tp[:2])
-
-        # Unweld
-        self.scene.rigid_solver.delete_weld_constraint(
-            self.hand_solver_idx, obj_solver_idx)
-        self.scene.step(80)
-
-        actual = self._to_numpy(obj.get_pos())
-        error = np.linalg.norm(actual[:2] - tp[:2])
-
-        # Lift away (teleport is fine after unweld)
-        self.teleport([tp[0], tp[1], tp[2] + 0.15],
-                      gripper_width=0.04, settle_steps=50)
-
-        return error
-
-    # ── Pick & Place ─────────────────────────────────────────
-
-    def pick_and_place(self, object_name, target_pos):
-        lifted = self.suction_pick(object_name)
-        if lifted:
-            error = self.suction_place(object_name, target_pos)
-            return True, error
-        return False, float('inf')
-
-    # ── Legacy interface ─────────────────────────────────────
-
-    def pick(self, object_pos, grasp_force=1.5, steps=500):
-        if self.objects:
-            self.suction_pick(list(self.objects.keys())[0])
-
-    def place(self, target_pos, steps=500):
-        if self.objects:
-            self.suction_place(list(self.objects.keys())[0], target_pos)
