@@ -32,7 +32,7 @@ Do NOT output coordinates — the system will compute exact positions."""
 
 
 class QwenVLWrapper:
-    def __init__(self, model_name: str = "Qwen/Qwen3-VL-2B-Instruct"):
+    def __init__(self, model_name: str = "Qwen/Qwen3-VL-8B-Instruct"):
         self.model_name = model_name
         self.model = None
         self.processor = None
