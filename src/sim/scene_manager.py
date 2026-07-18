@@ -229,16 +229,16 @@ def create_tabletop_scene(show_viewer=False) -> SceneManager:
     )
 
     # 8 objects on Kinematic table. Table top at z=0.05.
-    # Objects at x >= 0.55 to stay clear of robot base collision zone.
+    # Suction gripper works best with cubes and simple shapes.
     table_top = 0.05
-    scene.add_cup("red_cup", pos=(0.6, 0.0, table_top + 0.04))
-    scene.add_box("blue_box", pos=(0.55, 0.2, table_top + 0.035))
-    scene.add_sphere("green_apple", radius=0.03, pos=(0.7, -0.1, table_top + 0.03))
+    scene.add_box("red_cube", pos=(0.6, 0.0, table_top + 0.02))
+    scene.add_box("blue_cube", pos=(0.55, 0.2, table_top + 0.02))
+    scene.add_cup("green_cup", pos=(0.7, -0.1, table_top + 0.04))
     scene.add_bottle("yellow_bottle", pos=(0.6, -0.2, table_top + 0.075))
-    scene.add_sphere("red_tomato", radius=0.025, pos=(0.65, 0.1, table_top + 0.025))
-    scene.add_cup("blue_mug", pos=(0.75, 0.15, table_top + 0.04))
-    scene.add_box("white_cube", pos=(0.55, -0.1, table_top + 0.025))
-    scene.add_sphere("orange_ball", radius=0.02, pos=(0.7, -0.15, table_top + 0.02))
+    scene.add_box("white_cube", pos=(0.65, 0.1, table_top + 0.02))
+    scene.add_box("orange_cube", pos=(0.75, 0.15, table_top + 0.02))
+    scene.add_sphere("red_apple", radius=0.03, pos=(0.55, -0.1, table_top + 0.03))
+    scene.add_sphere("blue_ball", radius=0.02, pos=(0.7, -0.15, table_top + 0.02))
 
     scene.add_camera()
     scene.build()
