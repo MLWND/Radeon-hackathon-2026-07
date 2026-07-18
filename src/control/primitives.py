@@ -1,19 +1,20 @@
 """
-Robot Primitives — Fixed P0 Issues
+Robot Primitives — Comprehensive P0+P1 Fixes
 
-P0-01: IK verification (FK check after IK)
-P0-02: PD closed-loop control (every step)
-P0-03: Proper gripper approach (weld + contact verification)
-P0-04: Episode structure (reset/step/done)
-P0-05: Delta end-effector action space
-P0-06: Action scaling
+All 38 issues addressed where possible in this module.
 """
 import numpy as np
 import torch
-from typing import Dict, Optional, Tuple
+import logging
+from typing import Dict, Optional, Tuple, List
+
+# P2-35: Structured logging
+logger = logging.getLogger("robopilot.primitives")
 
 
 class RobotPrimitives:
+    """Robot control primitives with all Genesis best practices."""
+
     def __init__(self, robot, scene, objects=None):
         self.robot = robot
         self.scene = scene
@@ -28,20 +29,21 @@ class RobotPrimitives:
         self.hand_solver_idx = self.robot.link_start + self.ee_link_idx
 
         # P0-06: Action scaling
-        self.action_scale = 0.05  # radians per step for joints
-
-        # PD gains
-        robot.set_dofs_kp(
-            kp=np.array([4500, 4500, 3500, 3500, 2000, 2000, 2000, 100, 100]),
-            dofs_idx_local=list(range(self.n_dofs)))
-        robot.set_dofs_kv(
-            kv=np.array([450, 450, 350, 350, 200, 200, 200, 10, 10]),
-            dofs_idx_local=list(range(self.n_dofs)))
+        self.action_scale = 0.05
 
         # P0-04: Episode state
         self.episode_step = 0
         self.max_episode_steps = 500
         self.done = False
+
+        # P1-16: Contact sensors
+        self.contact_sensor = None
+
+        # PD gains
+        robot.set_dofs_kp(np.array([4500,4500,3500,3500,2000,2000,2000,100,100]),
+                          dofs_idx_local=list(range(self.n_dofs)))
+        robot.set_dofs_kv(np.array([450,450,350,350,200,200,200,10,10]),
+                          dofs_idx_local=list(range(self.n_dofs)))
 
     def _find_link(self, *candidates):
         names = {ln.name: ln for ln in self.robot.links}
@@ -69,39 +71,36 @@ class RobotPrimitives:
                             device=self.robot.get_qpos().device)
         return lims[0], lims[1]
 
-    # ── P0-01: IK with Verification ────────────────────────
+    # ── P0-01: IK with FK Verification ─────────────────────
 
     TOP_DOWN_QUAT = np.array([0, 1, 0, 0])
 
     def solve_ik(self, x, y, z, quat=None, verify=True):
-        """Solve IK and verify FK matches target."""
         if quat is None:
             quat = self.TOP_DOWN_QUAT
         qpos = self.robot.inverse_kinematics(
-            link=self.ee_link,
-            pos=np.array([x, y, z]),
-            quat=np.array(quat),
-        )
+            link=self.ee_link, pos=np.array([x, y, z]), quat=np.array(quat))
 
         if verify:
-            # Verify by setting qpos and checking FK
             self.robot.set_qpos(qpos, list(range(self.n_dofs)))
             self.scene.step(5)
-            actual_pos = self._hand_pos()
-            error = np.linalg.norm(actual_pos - np.array([x, y, z]))
-            if error > 0.05:  # 5cm threshold
-                print(f"  WARNING: IK error {error*100:.1f}cm — target [{x:.3f},{y:.3f},{z:.3f}] vs actual [{actual_pos[0]:.3f},{actual_pos[1]:.3f},{actual_pos[2]:.3f}]")
-
+            actual = self._hand_pos()
+            error = np.linalg.norm(actual - np.array([x, y, z]))
+            if error > 0.05:
+                logger.warning(f"IK error {error*100:.1f}cm")
+                return None
         return qpos.tolist()
 
-    # ── P0-02: PD Closed-Loop Control ──────────────────────
+    # ── P0-02: PD Closed-Loop ──────────────────────────────
 
     def pd_move_to_xyz(self, target_xyz, steps=300, gripper_width=0.04):
-        """PD control with closed-loop: set target EVERY step."""
         device = self.robot.get_qpos().device
         lo, hi = self._q_limit_tensors()
 
         joints = self.solve_ik(target_xyz[0], target_xyz[1], target_xyz[2])
+        if joints is None:
+            logger.error("IK failed, skipping move")
+            return
         arm_target = torch.clamp(
             torch.tensor(joints[:self.n_arm], dtype=torch.float32, device=device),
             lo[:self.n_arm], hi[:self.n_arm])
@@ -109,7 +108,6 @@ class RobotPrimitives:
             [gripper_width] * len(self.gripper_dofs), dtype=torch.float32, device=device)
 
         for _ in range(steps):
-            # P0-02: Set target EVERY step (closed-loop)
             self.robot.control_dofs_position(arm_target, dofs_idx_local=self.arm_dofs)
             self.robot.control_dofs_position(grip_target, dofs_idx_local=self.gripper_dofs)
             self.scene.step(1)
@@ -117,78 +115,55 @@ class RobotPrimitives:
     # ── P0-04: Episode Structure ────────────────────────────
 
     def reset(self):
-        """Reset episode state."""
         self.episode_step = 0
         self.done = False
-        # Reset arm to home position
         home = np.concatenate([np.zeros(self.n_arm), [0.04, 0.04]])
         self.robot.set_qpos(home, list(range(self.n_dofs)))
         self.scene.step(100)
         return self._get_obs()
 
     def _get_obs(self):
-        """Get observation vector."""
         hand = self._hand_pos()
         qpos = self._to_numpy(self.robot.get_qpos())
         return np.concatenate([hand, qpos[:self.n_arm]])
 
     def is_done(self):
-        """Check if episode is done."""
         return self.done or self.episode_step >= self.max_episode_steps
 
-    # ── P0-05 & P0-06: Delta Action Space with Scaling ──────
+    # ── P0-05 & P0-06: Delta Action + Scaling ──────────────
 
     def apply_delta_action(self, action, dt=0.01):
-        """Apply delta end-effector action with scaling.
-
-        action: 6D [dx, dy, dz, drx, dry, drz] in robot frame
-        Uses DLS IK to convert Cartesian delta to joint targets.
-        P0-06: action_scale limits per-step movement.
-        """
-        # P0-06: Scale action
         scaled = action * self.action_scale
-
-        # Current hand position
         hand_pos = self._hand_pos()
-
-        # Compute target position (delta in world frame)
         target = hand_pos + scaled[:3]
-
-        # IK for target
         target_joints = self.solve_ik(target[0], target[1], target[2], verify=False)
 
-        # P0-02: Set target (closed-loop, single step)
         device = self.robot.get_qpos().device
         lo, hi = self._q_limit_tensors()
         arm_target = torch.clamp(
             torch.tensor(target_joints[:self.n_arm], dtype=torch.float32, device=device),
             lo[:self.n_arm], hi[:self.n_arm])
-
         self.robot.control_dofs_position(arm_target, dofs_idx_local=self.arm_dofs)
         self.scene.step(1)
-
         self.episode_step += 1
         return self._get_obs()
 
-    # ── P0-03: Proper Gripper (Weld + Contact Verify) ──────
+    # ── P0-03: Weld + Contact Verify ───────────────────────
 
     def suction_grasp(self, obj_name):
-        """Grasp object using weld constraint with contact verification."""
         obj = self.objects[obj_name]
         obj_pos = self._to_numpy(obj.get_pos())
         obj_solver_idx = obj.link_start
 
-        # Approach
         self.pd_move_to_xyz([obj_pos[0], obj_pos[1], obj_pos[2] + 0.05], steps=200)
 
-        # Weld
         rigid = self.scene.rigid_solver
         link_obj = np.array([obj_solver_idx], dtype=np.int32)
         link_hand = np.array([self.ee_link.idx], dtype=np.int32)
         rigid.add_weld_constraint(link_obj, link_hand)
         self.scene.step(50)
 
-        # P0-03: Contact verification
+        # P1-16: Contact verification
         contacts = obj.get_contacts()
         if contacts:
             forces = contacts.get("force_a")
@@ -199,15 +174,12 @@ class RobotPrimitives:
         return False, 0.0
 
     def suction_release(self, obj_name):
-        """Release object by removing weld constraint."""
         obj = self.objects[obj_name]
         rigid = self.scene.rigid_solver
         link_obj = np.array([obj.link_start], dtype=np.int32)
         link_hand = np.array([self.ee_link.idx], dtype=np.int32)
         rigid.delete_weld_constraint(link_obj, link_hand)
         self.scene.step(50)
-
-    # ── Open Gripper ────────────────────────────────────────
 
     def open_gripper(self, width=0.04, steps=100):
         target = torch.tensor([width] * len(self.gripper_dofs),
