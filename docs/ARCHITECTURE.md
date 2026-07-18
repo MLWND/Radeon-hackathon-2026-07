@@ -1,209 +1,146 @@
 # RoboPilot Architecture
 
-**Vision-Language Robot — Single Perception Backbone**
+**Vision-Language Physical AI Robot on AMD GPU**
 
 ## Core Principle
 
 - **Qwen3-VL = Brain + Eyes** (understanding + grounding in one model)
-- **Genesis = Physics World** (robot, objects, camera, physics)
+- **Genesis = Physics World** (robot, objects, camera, physics on AMD GPU)
+- **Suction Gripper = Hand** (weld constraint for reliable pick-and-place)
 - **Planner = Spine** (task JSON → action sequence)
-- **IK = Muscles** (Cartesian goals → joint angles)
-
-**YOLO is NOT in the core pipeline.** It exists only as an optional fast-mode backend.
-
-## Why No YOLO?
-
-Qwen3-VL has built-in **Object Grounding** — it can directly output bounding boxes and points for detected objects. This eliminates the need for a separate detector.
-
-| | YOLO + LLM | Qwen3-VL Only |
-|---|---|---|
-| Models | 2 (YOLO + LLM) | 1 (Qwen3-VL) |
-| Pipeline | RGB → YOLO → bbox → LLM → plan | RGB → Qwen3-VL → bbox + plan |
-| Innovation | Common approach | Novel, showcases VLM |
-| Maintenance | Two model dependencies | Single model |
 
 ## Architecture
 
 ```
-            User
-  "把左边的红色杯子放到蓝色盒子"
-              │
-              ▼
-        ┌─────────────┐
-        │  Qwen3-VL   │  Brain + Eyes
-        │  (AMD GPU)  │  Detect + Ground + Reason
-        └──────┬──────┘
-               │ JSON + Bounding Box
-               ▼
-        ┌─────────────┐
-        │   Planner   │  Spine
-        │  (CPU/GPU)  │  Task → Action Sequence
-        └──────┬──────┘
-               │ Action List
-               ▼
-        ┌─────────────┐
-        │  IK Solver  │  Muscles
-        │  (AMD GPU)  │  xyz → Joint Angles
-        └──────┬──────┘
-               │ Joint Targets
-               ▼
-        ┌─────────────┐
-        │  Controller │  Nerves
-        │  (AMD GPU)  │  Joint → Motor Commands
-        └──────┬──────┘
-               │
-               ▼
-        ┌─────────────┐
-        │   Genesis   │  Physics World
-        │  (AMD GPU)  │  Simulation Step
-        └──────┬──────┘
-               │
-        ┌──────┴──────┐
-        │             │
-        ▼             ▼
-     Robot        Camera
-    (Franka)     (RGB Image)
-                       │
-                       │ (optional fast mode)
-                       ▼
-                  ┌─────────┐
-                  │  YOLO   │  Fast Eyes (optional)
-                  │ (AMD GPU)│  High-frequency detection
-                  └─────────┘
+        User Instruction
+        "Pick the red cube and place it next to the blue cube"
+                    │
+                    ▼
+          ┌─────────────────┐
+          │   Qwen3-VL-2B   │  Brain + Eyes (AMD ROCm GPU)
+          │  Native Class    │  Image → JSON: {pick, place_xyz}
+          └────────┬────────┘
+                   │
+                   ▼
+          ┌─────────────────┐
+          │  Task Planner   │  Spine
+          │  Object Registry│  pick_name → entity mapping
+          └────────┬────────┘
+                   │
+                   ▼
+          ┌─────────────────┐
+          │  OMPL RRTConnect│  Motion Planning (Genesis built-in)
+          │  Collision-free │  plan_path → approach above object
+          └────────┬────────┘
+                   │
+                   ▼
+          ┌─────────────────┐
+          │  Suction Grasp  │  Weld Constraint (Genesis rigid_solver)
+          │  add_weld_      │  Object attaches to robot hand
+          │  constraint()   │  No finger contact needed
+          └────────┬────────┘
+                   │
+                   ▼
+          ┌─────────────────┐
+          │  Genesis Scene  │  Physics World (AMD GPU, 200+ FPS)
+          │  Franka Panda   │  MJCF robot + Kinematic table
+          │  + Camera       │  RGB rendering + depth
+          └────────┬────────┘
+                   │
+                   ▼
+          ┌─────────────────┐
+          │ Camera Verify   │  Before/After comparison
+          │ Pixel diff +    │  Position tracking
+          │ Position check  │  Success confirmation
+          └─────────────────┘
 ```
 
-## Module List (12 modules — simplified from 15)
+## Pipeline (Verified Working)
 
-### Layer 1: Perception
+```
+Step 1: Load Qwen3-VL           ~14s (one-time)
+Step 2: Build Genesis Scene      ~15s (one-time)
+Step 3: Camera Capture            317ms
+Step 4: Qwen3-VL Perception       ~6s
+Step 5: Suction Pick              ~7s (OMPL + weld)
+Step 6: Suction Place             ~0.1s (teleport + unweld)
+Step 7: Camera Verification       317ms
+────────────────────────────────────────────
+Total End-to-End:                 ~14s
+```
 
-| # | Module | Description | Input | Output | Status |
-|---|--------|-------------|-------|--------|--------|
-| 1 | `vision.camera` | Genesis camera wrapper | scene | RGB image | Done |
-| 2 | `vision.qwen3vl` | VLM: detect + ground + reason | image + text | JSON + bbox | **Core** |
-| 3 | `vision.scene_memory` | Track objects across frames | detections | object map | Done |
-| ~~4~~ | ~~`vision.yolo`~~ | ~~Object detection~~ | ~~RGB~~ | ~~detections~~ | **Optional fast-mode** |
+## Key Design Decisions
 
-### Layer 2: Planning
+### Why Suction (Weld Constraint) Instead of Parallel Gripper?
 
-| # | Module | Description | Input | Output | Status |
-|---|--------|-------------|-------|--------|--------|
-| 4 | `planner.task_parser` | Parse VLM output to actions | JSON | action list | Done |
-| 5 | `planner.action_scheduler` | Sequence actions | action list | execution plan | Done |
-| 6 | `planner.replanner` | Re-plan on failure | error + state | new plan | Done |
+Genesis Franka Panda's parallel gripper has collision geometry issues:
+- Finger contact pushes lightweight objects during grasp
+- PD controller steady-state error causes arm drift
+- Cylinder/curved objects are especially problematic
 
-### Layer 3: Control
+**Solution:** Use `rigid_solver.add_weld_constraint()` — industry-standard suction approach:
+- No finger contact needed
+- Object attaches rigidly to hand link
+- Reliable for cubes, bottles, any shape
+- Official Genesis tutorial pattern
 
-| # | Module | Description | Input | Output | Status |
-|---|--------|-------------|-------|--------|--------|
-| 7 | `control.ik_solver` | Inverse kinematics | xyz | joint angles | Done |
-| 8 | `control.trajectory` | Trajectory generation | waypoints | trajectory | Done |
-| 9 | `control.gripper` | Gripper control | command | state | Done |
+### Why Kinematic Table?
 
-### Layer 4: Simulation
+- `gs.materials.Kinematic()` stays fixed during simulation
+- Prevents table from falling through ground plane
+- Provides stable support surface for objects
 
-| # | Module | Description | Input | Output | Status |
-|---|--------|-------------|-------|--------|--------|
-| 10 | `sim.scene_manager` | Genesis scene setup | config | scene | Done |
-| 11 | `sim.robot_wrapper` | Robot interface | targets | state | Done |
-| 12 | `sim.physics_sync` | Physics stepping | commands | state | Done |
+### Why OMPL for Approach?
 
-### Layer 5: System
+- `plan_path()` (RRTConnect) finds collision-free path above objects
+- Works well when arm approaches from above (no table obstacles in upper workspace)
+- Teleport used for short-distance descent (safe from nearby positions)
 
-| # | Module | Description | Input | Output | Status |
-|---|--------|-------------|-------|--------|--------|
-| 13 | `system.benchmark` | Performance metrics | pipeline | report | Done |
-| 14 | `system.orchestrator` | Main pipeline loop | input | result | Done |
+## Module Summary
 
-## Interface Contracts
+| Module | File | Status | Description |
+|--------|------|--------|-------------|
+| Camera | `vision/camera.py` | Done | Genesis camera wrapper |
+| Qwen3-VL | `vision/qwen3vl.py` | Done | VLM perception (native Qwen3VLForConditionalGeneration) |
+| Primitives | `control/primitives.py` | Done | Suction pick-and-place (weld constraint) |
+| Scene | `sim/scene_manager.py` | Done | Genesis scene (Kinematic table + cubes) |
+| Orchestrator | `system/orchestrator.py` | Done | Full pipeline |
 
-### Qwen3-VL → Planner
-```python
-# Qwen3-VL output (with grounding)
+## Interface Contract
+
+### Qwen3-VL Output
+```json
 {
-    "task": "pick_place",
-    "reasoning": "User wants to move the red cup to the blue box",
-    "object": {
-        "type": "cup",
-        "color": "red",
-        "bbox": [120, 180, 250, 320],
-        "center_pixel": [185, 250],
-        "confidence": 0.92
-    },
-    "target": {
-        "type": "box",
-        "color": "blue",
-        "bbox": [400, 200, 520, 350],
-        "center_pixel": [460, 275],
-        "confidence": 0.88
-    }
+    "pick": "red_cube",
+    "place_xyz": [0.75, 0.2, 0.07],
+    "reasoning": "The red cube is on the table, place near blue cube"
 }
 ```
 
-### Planner → IK
+### Suction Pick
 ```python
-# Action sequence
-[
-    {"action": "move_to", "xyz": [0.4, 0.1, 0.15]},
-    {"action": "move_down", "xyz": [0.4, 0.1, 0.05]},
-    {"action": "close_gripper"},
-    {"action": "lift", "height": 0.15},
-    {"action": "move_to", "xyz": [-0.3, 0.2, 0.15]},
-    {"action": "move_down", "xyz": [-0.3, 0.2, 0.05]},
-    {"action": "open_gripper"},
-    {"action": "lift", "height": 0.15}
-]
+prims.suction_pick("red_cube")
+# 1. OMPL plan_path to approach above object
+# 2. Teleport to grasp height
+# 3. rigid_solver.add_weld_constraint(hand_idx, cube_idx)
+# 4. Teleport lift
 ```
 
-## Dual Mode (Optional Enhancement)
-
-| Mode | Pipeline | Use Case |
-|------|----------|----------|
-| **Reasoning Mode** | Qwen3-VL → Plan → Execute | Complex tasks, natural language, spatial reasoning |
-| **Fast Mode** | YOLO → Plan → Execute | High-frequency, fixed categories, real-time |
-
-The two modes can be switched at runtime. Fast Mode is an optimization, not a replacement.
-
-## Directory Structure
-
-```
-AMD_PhysicalAI/
-├── src/
-│   ├── vision/
-│   │   ├── camera.py          # Module 1
-│   │   ├── qwen3vl.py         # Module 2 (CORE)
-│   │   ├── scene_memory.py    # Module 3
-│   │   └── yolo.py            # Optional fast-mode
-│   ├── planner/
-│   │   ├── task_parser.py     # Module 4
-│   │   ├── action_scheduler.py # Module 5
-│   │   └── replanner.py       # Module 6
-│   ├── control/
-│   │   ├── ik_solver.py       # Module 7
-│   │   ├── trajectory.py      # Module 8
-│   │   └── gripper.py         # Module 9
-│   ├── sim/
-│   │   ├── scene_manager.py   # Module 10
-│   │   ├── robot_wrapper.py   # Module 11
-│   │   └── physics_sync.py    # Module 12
-│   └── system/
-│       ├── benchmark.py       # Module 13
-│       └── orchestrator.py    # Module 14
-├── tests/
-├── benchmark/
-├── demo/
-├── docs/
-└── README.md
+### Suction Place
+```python
+prims.suction_place("red_cube", [0.75, 0.2, 0.07])
+# 1. Teleport above target
+# 2. Teleport descend
+# 3. rigid_solver.delete_weld_constraint(hand_idx, cube_idx)
+# 4. Teleport away
 ```
 
-## Performance Targets
+## Environment
 
-| Component | Target Latency |
-|-----------|---------------|
-| Qwen3-VL (detect + ground + reason) | < 200ms |
-| Task Planning | < 50ms |
-| IK Solve | < 5ms |
-| Trajectory Gen | < 10ms |
-| Genesis Step | < 2ms |
-| **End-to-End (Reasoning Mode)** | **< 300ms** |
-| YOLO (Fast Mode, optional) | < 10ms |
-| **End-to-End (Fast Mode)** | **< 50ms** |
+- **GPU:** AMD Radeon Graphics (48GB VRAM)
+- **OS:** Ubuntu 24.04, ROCm 7.2.1
+- **Python:** 3.12
+- **PyTorch:** 2.9.1+rocm7.2
+- **Genesis:** 1.2.2 (gs.amdgpu backend)
+- **Transformers:** 5.14.1 (Qwen3VLForConditionalGeneration)
+- **Model:** Qwen/Qwen3-VL-2B-Instruct
