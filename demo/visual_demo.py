@@ -58,13 +58,13 @@ def main():
 
     # ── 1. Load Qwen3-VL ────────────────────────────────────
     header("Step 1: Load Qwen3-VL")
-    from transformers import Qwen3VLForConditionalGeneration, AutoProcessor
+    from transformers import AutoModelForImageTextToText, AutoProcessor
     from PIL import Image
 
     t0 = time.time()
     processor = AutoProcessor.from_pretrained("Qwen/Qwen3-VL-2B-Instruct")
-    vlm_model = Qwen3VLForConditionalGeneration.from_pretrained(
-        "Qwen/Qwen3-VL-2B-Instruct", torch_dtype=torch.float16, device_map="auto")
+    vlm_model = AutoModelForImageTextToText.from_pretrained(
+        "Qwen/Qwen3-VL-2B-Instruct", dtype="auto", device_map="auto")
     print(f"  Loaded in {time.time()-t0:.1f}s on {vlm_model.device}")
 
     # ── 2. Build Scene ──────────────────────────────────────
