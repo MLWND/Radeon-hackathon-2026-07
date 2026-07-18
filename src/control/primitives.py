@@ -22,6 +22,7 @@ class RobotPrimitives:
         self.ee_link = self._find_link("hand", "link7", "panda_hand", "panda_link7")
         self.ee_link_idx = self._find_link_list_index(self.ee_link)
         self.hand_solver_idx = self.robot.link_start + self.ee_link_idx
+        self.render_callback = None  # set by caller for video recording
 
         robot.set_dofs_kp(
             kp=np.array([4500, 4500, 3500, 3500, 2000, 2000, 2000, 100, 100]),
@@ -53,6 +54,11 @@ class RobotPrimitives:
     def _hand_pos(self):
         return self._to_numpy(self.robot.get_links_pos()[self.ee_link_idx])
 
+    def _render(self):
+        """Call render_callback if set, for video recording."""
+        if self.render_callback:
+            self.render_callback()
+
     # ── IK ───────────────────────────────────────────────────
 
     TOP_DOWN_QUAT = np.array([0, 1, 0, 0])
@@ -81,11 +87,13 @@ class RobotPrimitives:
         if np.abs(last - first).max() < 1e-5:
             return False
 
-        for wp in path:
+        for i, wp in enumerate(path):
             wp_np = wp.cpu().numpy()[:self.n_dofs]
             self.robot.control_dofs_position(
                 torch.tensor(wp_np, dtype=torch.float32, device=device))
             self.scene.step(steps_per_wp)
+            if i % 5 == 0:
+                self._render()
         return True
 
     # ── Teleport (fast, for approach only) ───────────────────
