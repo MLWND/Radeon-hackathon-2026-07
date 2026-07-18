@@ -24,13 +24,11 @@ class SceneConfig:
 
 
 # ── Asset Paths ──────────────────────────────────────────────
-# Use panda_no_tendon.xml — the standard panda.xml has tendon-driven finger
-# actuators approximated in Genesis, which makes control_dofs_position not
-# reliably drive the gripper. The no-tendon variant has independent prismatic
-# joint actuators that respond to position targets correctly.
+# Use panda.xml (standard) — compatible with plan_path() OMPL motion planner.
+# The no_tendon variant has collision geometry issues with RRTConnect.
 _GENESIS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)),
     "../../venv/lib/python3.12/site-packages/genesis/assets")
-FRANKA_MJCF = os.path.join(_GENESIS_DIR, "xml/franka_emika_panda/panda_no_tendon.xml")
+FRANKA_MJCF = os.path.join(_GENESIS_DIR, "xml/franka_emika_panda/panda.xml")
 FRANKA_URDF = os.path.join(_GENESIS_DIR, "urdf/panda_bullet/panda.urdf")
 
 
@@ -154,23 +152,24 @@ class SceneManager:
 
     def build(self):
         self.scene.build()
+        # Set robot to safe initial configuration (avoids joint limit warnings
+        # and ensures plan_path can find collision-free trajectories)
+        self._set_safe_config()
         return self
 
-    def _go_to_ready_pose(self):
-        """Set Franka to a slightly bent 'ready' pose via teleport (set_qpos).
-
-        Uses a conservative bend that keeps the arm mostly vertical to avoid
-        colliding with tabletop objects. The previous [-1.5, 0, 1.5] bends
-        brought the arm down into the workspace, knocking objects off the table.
-        """
+    def _set_safe_config(self):
+        """Set Franka to a safe configuration after build."""
         import torch
         if self.robot is None or self.robot.n_dofs < 7:
             return
-        ready = torch.tensor(
-            [0.0, 0.0, 0.0, -0.3, 0.0, 0.3, 0.0, 0.04, 0.04][: self.robot.n_dofs],
+        safe_qpos = torch.tensor(
+            [0, 0, 0, -1.0, 0, 1.0, 0, 0.04, 0.04][: self.robot.n_dofs],
             dtype=torch.float32, device=self.robot.get_qpos().device,
         )
-        self.robot.set_qpos(ready)
+        self.robot.set_dofs_position(safe_qpos, list(range(self.robot.n_dofs)))
+        # Let physics settle
+        for _ in range(200):
+            self.scene.step()
 
     def step(self, n=1):
         for _ in range(n):
