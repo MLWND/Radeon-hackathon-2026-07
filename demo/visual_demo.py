@@ -144,59 +144,64 @@ def main():
         p = ents[n].get_pos().cpu().numpy()
         print(f"  {n:12s}: [{p[0]:.3f}, {p[1]:.3f}, {p[2]:.3f}]")
 
-    # ── 3. VLM Perception ──────────────────────────────────
-    header("Step 3: Qwen3-VL Perception")
-    img_before = camera.render()[0]
-    Image.fromarray(img_before).save("demo/output/visual_before.png")
+    # ── 3. VLM Perception (OPTIMIZED) ────────────────────────
+    header("Step 3: Qwen3-VL Perception (Optimized)")
+    img_full = camera.render()[0]
+    Image.fromarray(img_full).save("demo/output/visual_before.png")
 
     INSTRUCTION = "Pick the red cube and place it in the blue goal area"
     print(f"  Instruction: \"{INSTRUCTION}\"")
 
-    obj_lines = []
-    for name in ents:
-        pos = ents[name].get_pos().cpu().numpy()
-        obj_lines.append(f"  - {name}: at [{pos[0]:.2f}, {pos[1]:.2f}]")
+    obj_names = list(ents.keys())
 
-    prompt = f"""Analyze this image for a robotic pick-and-place task.
-Instruction: {INSTRUCTION}
-Available objects:
-{chr(10).join(obj_lines)}
-Goal area: blue transparent box at [0.75, 0.20]
+    # SHORT prompt — minimal tokens
+    prompt = f"""Return ONLY JSON: {{"pick":"name","place":"relative desc"}}
+Objects: {obj_names}
+Instruction: {INSTRUCTION}"""
 
-Determine which object to PICK and where to PLACE it.
-Output ONLY valid JSON:
-{{"pick": "object_name", "place_relative": "description relative to goal area", "reasoning": "brief explanation"}}"""
+    # Resize to 448x448 for faster inference
+    VLM_SIZE = 448
+    pil_img = Image.fromarray(img_full).resize((VLM_SIZE, VLM_SIZE), Image.LANCZOS)
 
     messages = [{"role": "user", "content": [
-        {"type": "image", "image": Image.fromarray(img_before)},
+        {"type": "image", "image": pil_img},
         {"type": "text", "text": prompt},
     ]}]
 
-    t0 = time.time()
+    # Timed pipeline
+    t_render_end = time.time()
+    t_preprocess = time.time()
     text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-    inputs = processor(text=[text], images=[Image.fromarray(img_before)],
-                       return_tensors="pt").to(vlm_model.device)
+    inputs = processor(text=[text], images=[pil_img], return_tensors="pt").to(vlm_model.device)
+    t_preprocess = (time.time() - t_preprocess) * 1000
+
+    t_infer = time.time()
     with torch.no_grad():
-        output = vlm_model.generate(**inputs, max_new_tokens=256, do_sample=False)
+        output = vlm_model.generate(**inputs, max_new_tokens=64, do_sample=False)
+    t_infer = (time.time() - t_infer) * 1000
+
+    t_decode = time.time()
     raw = processor.decode(output[0], skip_special_tokens=True)
-    vlm_ms = (time.time() - t0) * 1000
+    t_decode = (time.time() - t_decode) * 1000
+
+    vlm_ms = t_preprocess + t_infer + t_decode
+    print(f"  VLM timing: preprocess={t_preprocess:.0f}ms, infer={t_infer:.0f}ms, decode={t_decode:.0f}ms, total={vlm_ms:.0f}ms")
+    print(f"  Input: {VLM_SIZE}x{VLM_SIZE} | max_tokens: 64")
 
     pick_name = "red_cube"
     place_relative = "in the goal area"
-    reasoning = ""
     try:
         s = raw.rfind("```json"); e = raw.rfind("```")
         block = raw[s+7:e].strip() if s >= 0 and e > s else raw[raw.find("{"):raw.rfind("}")+1]
         r = json.loads(block)
         pick_name = r.get("pick", "red_cube")
-        place_relative = r.get("place_relative", "in the goal area")
-        reasoning = r.get("reasoning", "")
+        place_relative = r.get("place", "in the goal area")
         if pick_name not in ents:
             pick_name = "red_cube"
     except Exception:
         pass
 
-    print(f"  VLM ({vlm_ms:.0f}ms): pick={pick_name}, place={place_relative}")
+    print(f"  Result: pick={pick_name}, place={place_relative}")
 
     # ── 4. Execute ──────────────────────────────────────────
     header("Step 4: Execute Pick & Place")
