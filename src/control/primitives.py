@@ -1,11 +1,11 @@
 """
 Robot Primitives — 5 basic actions for tabletop manipulation.
-Uses Genesis control_dofs_position (PD controller) for real physics interaction.
 
-Why this matters:
-  - set_qpos() is a state teleport (no forces, gripper can't grasp objects)
-  - control_dofs_position() drives the robot toward the target via PD controller
-  - inverse_kinematics() is Genesis' built-in, GPU-accelerated IK solver
+Following Genesis World tutorial:
+- plan_path() for collision-free motion planning
+- control_dofs_force() for gripper grasping
+- set_dofs_kp/kv/force_range for PD controller tuning
+- inverse_kinematics() with quat=[0,1,0,0] for top-down orientation
 
 Primitives: Move, Open Gripper, Close Gripper, Pick, Place.
 """
@@ -17,294 +17,155 @@ from typing import List, Optional
 class RobotPrimitives:
     def __init__(self, robot, scene, objects=None):
         """
-        robot: gs.RigidEntity
+        robot: gs.RigidEntity (Franka Panda)
         scene: gs.Scene (used for scene.step)
-        objects: optional {name: entity} dict from SceneManager — enables
-                 self.objects[name].get_pos() and proper recovery updates
+        objects: optional {name: entity} dict from SceneManager
         """
         self.robot = robot
         self.scene = scene
-        self.objects = objects or {}  # Genesis entities by name (e.g. {"red_cup": entity})
+        self.objects = objects or {}
         self.n_dofs = robot.n_dofs
         self.n_arm = min(7, self.n_dofs)  # Franka arm joints
         self.gripper_dofs = list(range(self.n_arm, self.n_dofs))  # gripper DOF indices
         self.arm_dofs = list(range(self.n_arm))
 
-        # End-effector link ("hand") for IK target
-        self.ee_link = self._find_link("hand", "link7", "panda_hand", "panda_link7")
-        # Use the link's position in robot.links list for get_links_pos() indexing,
-        # NOT link.idx (which is Genesis' internal index, may differ).
-        self.ee_link_idx = self._find_link_list_index(self.ee_link)
+        # End-effector link for IK target
+        self.ee_link = robot.get_link("hand")
 
-        # Cache computed IK targets to avoid recomputation
-        self._ik_cache = {}
+        # Configure PD gains (from Genesis tutorial)
+        robot.set_dofs_kp(
+            kp=np.array([4500, 4500, 3500, 3500, 2000, 2000, 2000, 100, 100]),
+            dofs_idx_local=list(range(self.n_dofs)),
+        )
+        robot.set_dofs_kv(
+            kv=np.array([450, 450, 350, 350, 200, 200, 200, 10, 10]),
+            dofs_idx_local=list(range(self.n_dofs)),
+        )
+        robot.set_dofs_force_range(
+            lower=np.array([-87, -87, -87, -87, -12, -12, -12, -100, -100]),
+            upper=np.array([87, 87, 87, 87, 12, 12, 12, 100, 100]),
+            dofs_idx_local=list(range(self.n_dofs)),
+        )
 
-    def _find_link(self, *candidates):
-        names = {ln.name: ln for ln in self.robot.links}
-        for c in candidates:
-            if c in names:
-                return names[c]
-        return list(names.values())[-1]  # last link as fallback
+    # ── IK ───────────────────────────────────────────────────
 
-    def _find_link_list_index(self, link):
-        """Find the index of a link in robot.links list (for get_links_pos indexing)."""
-        for i, ln in enumerate(self.robot.links):
-            if ln is link:
-                return i
-        return len(self.robot.links) - 1
+    # Top-down orientation: gripper points down (180° rotation about X)
+    TOP_DOWN_QUAT = np.array([0, 1, 0, 0])
 
-    # ── State accessors ─────────────────────────────────────
+    def solve_ik(self, x: float, y: float, z: float, quat=None) -> List[float]:
+        """Solve IK for target position. Uses top-down orientation by default."""
+        if quat is None:
+            quat = self.TOP_DOWN_QUAT
+        qpos = self.robot.inverse_kinematics(
+            link=self.ee_link,
+            pos=np.array([x, y, z]),
+            quat=np.array(quat),
+        )
+        return qpos.tolist()
 
-    def _get_arm_qpos(self) -> np.ndarray:
-        return self.robot.get_qpos()[:self.n_arm].cpu().numpy()
+    # ── Motion Planning ──────────────────────────────────────
 
-    def _set_arm_qpos_raw(self, joints):
-        """Teleport (use only for FK/IK probing, never in execution)."""
-        qpos = self.robot.get_qpos().clone()
-        for i, val in enumerate(list(joints)[:self.n_arm]):
-            qpos[i] = float(val)
-        self.robot.set_qpos(qpos)
-
-    def _get_gripper_qpos(self) -> np.ndarray:
-        return self.robot.get_qpos()[self.n_arm:self.n_dofs].cpu().numpy()
-
-    # ── PD-control execution ────────────────────────────────
-    # control_dofs_position(target, dofs_idx_local) tells the
-    # built-in controller to drive the selected DOFs to target.
-
-    def _q_limit_tensors(self):
-        """Get joint limit tensors (cached)."""
-        lims = torch.tensor(np.asarray(self.robot.q_limit), dtype=torch.float32, device=self.robot.get_qpos().device)
-        return lims[0], lims[1]  # (lower, upper) (n_dofs,)
-
-    def control_arm_to(self, arm_qpos, steps: int = 300):
-        """Drive arm joints toward target via PD controller."""
-        target = torch.tensor(list(arm_qpos), dtype=torch.float32, device=self.robot.get_qpos().device)
-        lo, hi = self._q_limit_tensors()
-        target = torch.clamp(target, lo[:self.n_arm], hi[:self.n_arm])
-        self.robot.control_dofs_position(target, dofs_idx_local=self.arm_dofs)
-        self.scene.step(steps)
-
-    def control_gripper_to(self, width: float, steps: int = 100):
-        """Drive gripper DOFs toward target width."""
-        target = torch.tensor([width] * len(self.gripper_dofs), dtype=torch.float32, device=self.robot.get_qpos().device)
-        lo, hi = self._q_limit_tensors()
-        gripper_idx = torch.tensor(self.gripper_dofs, dtype=torch.long, device=target.device)
-        target = torch.clamp(target, lo[gripper_idx], hi[gripper_idx])
-        self.robot.control_dofs_position(target, dofs_idx_local=self.gripper_dofs)
-        self.scene.step(steps)
-
-    # ── IK via Genesis built-in ──────────────────────────────
-
-    # "Ready" pose init for IK — a slightly bent Franka arm pose.
-    # Used only when the arm is at home (all zeros); otherwise current state is used.
-    READY_INIT_QPOS = [0.0, 0.0, 0.0, -0.3, 0.0, 0.3, 0.0]
-
-    def _solve_ik(self, x: float, y: float, z: float, quat: Optional[List[float]] = None) -> List[float]:
-        """Solve IK for target position (x, y, z).
-
-        Tries Genesis inverse_kinematics first, then verifies the result with FK.
-        Falls back to Jacobian IK if Genesis IK result has large FK error (> 2cm).
-        """
-        device = self.robot.get_qpos().device
-        target = np.array([x, y, z])
-        init_qpos = self.robot.get_qpos().clone()
-
-        # If arm is near home (all zeros), use ready pose for IK init
-        arm_vals = init_qpos[:self.n_arm].abs().sum().item()
-        if arm_vals < 0.1:
-            for i, val in enumerate(self.READY_INIT_QPOS[:self.n_arm]):
-                init_qpos[i] = val
-
-        # Try Genesis IK
-        try:
-            target_t = torch.tensor([x, y, z], dtype=torch.float32, device=device)
-            kwargs = dict(
-                link=self.ee_link,
-                pos=target_t,
-                init_qpos=init_qpos,
-                max_samples=500,
-                max_solver_iters=100,
-                damping=0.01,
-                pos_tol=0.0001,
-                rot_tol=0.01,
-                respect_joint_limit=True,
-                return_error=False,
-            )
-            if quat is not None:
-                kwargs["quat"] = torch.tensor(quat, dtype=torch.float32, device=device)
-            result = self.robot.inverse_kinematics(**kwargs)
-            joints = result[:self.n_arm].tolist()
-
-            # Verify with FK — if error is small, use Genesis IK result
-            ee_pos = self._fk_safe(joints)
-            error = np.linalg.norm(target - ee_pos)
-            if error < 0.02:
-                return joints
-            # Genesis IK converged but FK mismatch — fall through to Jacobian
-        except Exception:
-            pass
-
-        # Jacobian IK — FK is always consistent since it uses get_links_pos()
-        return self._solve_ik_jacobian(x, y, z)
-
-    def _solve_ik_jacobian(self, x, y, z) -> List[float]:
-        """Jacobian-based fallback IK with state-safe FK."""
-        target = np.array([x, y, z])
-        joints = self._get_arm_qpos().copy()
+    def plan_and_execute(self, qpos_goal, num_waypoints=200):
+        """Plan collision-free path and execute it."""
+        path = self.robot.plan_path(
+            qpos_goal=qpos_goal,
+            num_waypoints=num_waypoints,
+        )
+        for waypoint in path:
+            self.robot.control_dofs_position(waypoint)
+            self.scene.step()
+        # Let PD controller settle
         for _ in range(100):
-            ee_pos = self._fk_safe(joints)
-            error = target - ee_pos
-            if np.linalg.norm(error) < 0.003:
-                break
-            J = self._jacobian(joints)
-            lam = 0.05
-            JJT = J @ J.T + lam**2 * np.eye(3)
-            delta = J.T @ np.linalg.solve(JJT, error)
-            delta = np.clip(delta, -0.03, 0.03)
-            joints = joints + delta
-        return joints.tolist()
-
-    def _fk_safe(self, joints):
-        """State-safe forward kinematics for Jacobian fallback only."""
-        saved = self.robot.get_qpos().clone()
-        self._set_arm_qpos_raw(joints)
-        links_pos = self.robot.get_links_pos()
-        ee_pos = links_pos[self.ee_link_idx].detach().cpu().numpy()
-        self.robot.set_qpos(saved)
-        return ee_pos
-
-    def _jacobian(self, joints, eps=0.005):
-        J = np.zeros((3, self.n_arm))
-        for i in range(self.n_arm):
-            q_plus = joints.copy(); q_plus[i] += eps
-            p_plus = self._fk_safe(q_plus)
-            q_minus = joints.copy(); q_minus[i] -= eps
-            p_minus = self._fk_safe(q_minus)
-            J[:, i] = (p_plus - p_minus) / (2 * eps)
-        return J
+            self.scene.step()
 
     # ── Primitive 1: Move ────────────────────────────────────
 
-    def teleport_arm_to(self, target_joints: List[float]):
-        """Teleport arm to target joints via set_qpos (instant, no physics interaction).
+    def move_to_xyz(self, x: float, y: float, z: float, quat=None):
+        """Plan and execute motion to target XYZ position."""
+        qpos = self.solve_ik(x, y, z, quat)
+        # Set gripper to open
+        qpos[-2:] = 0.04
+        self.plan_and_execute(qpos)
 
-        Use for large movements where PD convergence is too slow.
-        Not suitable for grasp/release (gripper needs PD forces).
-        """
-        qpos = self.robot.get_qpos().clone()
-        for i, val in enumerate(list(target_joints)[:self.n_arm]):
-            qpos[i] = float(val)
-        self.robot.set_qpos(qpos)
-
-    def move_to(self, target_joints: List[float], steps: int = 300):
-        self.control_arm_to(target_joints, steps)
-
-    def move_above_object(self, object_pos: List[float], height: float = 0.10):
-        """Move hand to be directly above the object by `height` (default 10 cm).
-        Uses teleport for fast, precise positioning.
-        """
-        joints = self._solve_ik(object_pos[0], object_pos[1], object_pos[2] + height)
-        self.teleport_arm_to(joints)
-
-    def move_to_object(self, object_pos: List[float], offset_z: float = 0.0):
-        """Move hand to be at object height + offset_z for gripper-finger alignment.
-        Uses teleport for fast, precise positioning.
-        """
-        joints = self._solve_ik(object_pos[0], object_pos[1], object_pos[2] + offset_z)
-        self.teleport_arm_to(joints)
+    def move_above_object(self, object_pos: List[float], height: float = 0.12):
+        """Move hand above object for pre-grasp."""
+        self.move_to_xyz(object_pos[0], object_pos[1], object_pos[2] + height)
 
     # ── Primitive 2: Open Gripper ────────────────────────────
 
     def open_gripper(self, width: float = 0.04, steps: int = 100):
-        self.control_gripper_to(width, steps)
+        """Open gripper via PD position control."""
+        target = torch.tensor([width] * len(self.gripper_dofs),
+                              dtype=torch.float32, device=self.robot.get_qpos().device)
+        self.robot.control_dofs_position(target, dofs_idx_local=self.gripper_dofs)
+        self.scene.step(steps)
 
-    # ── Primitive 3: Close Gripper ───────────────────────────
+    # ── Primitive 3: Close Gripper (force control) ───────────
 
-    def close_gripper(self, width: float = 0.0, steps: int = 100, grasp_target_diameter: Optional[float] = None):
-        """Gripper close. If grasp_target_diameter given, close fingers to that width
-        so they press against the object's sides (good for position-control grips).
-        Otherwise close fully (good for force-controlled grips).
+    def close_gripper_force(self, force_per_finger: float = 1.0, steps: int = 200):
+        """Close gripper using force control (from Genesis tutorial).
+
+        Uses control_dofs_force() — applies inward force per finger.
+        More robust than position control for grasping.
         """
-        if grasp_target_diameter is not None:
-            width = max(width, grasp_target_diameter * 0.95)  # slight squeeze
-        self.control_gripper_to(width, steps)
+        force = torch.tensor([-force_per_finger, -force_per_finger],
+                             dtype=torch.float32, device=self.robot.get_qpos().device)
+        self.robot.control_dofs_force(force, dofs_idx_local=self.gripper_dofs)
+        self.scene.step(steps)
 
-    # ── Primitive 4: Pick ────────────────────────────────────
+    # ── Primitive 4: Pick (tutorial-based) ────────────────────
 
-    # Finger length below the hand link (TCP) — used to offset approach height
-    # so fingers reach the object center without the hand overlapping.
-    FINGER_LENGTH = 0.05
-
-    def pick(self, object_pos: List[float], steps: int = 500, grasp_diameter: float = 0.034):
-        """Pick sequence: open → teleport above → PD descend → close → PD lift.
-
-        Strategy (tested on GPU with Genesis 1.2.2):
-          1. Open gripper
-          2. Teleport above object (z+0.10) — safe, no collision with object
-          3. PD descend to grasp height (z+0.02) — slow approach avoids pushing object
-          4. Close gripper with PD control
-          5. PD lift (z+0.20)
-
-        grasp_diameter: closed-target width so fingers press against object sides.
+    def pick(self, object_pos: List[float], num_waypoints: int = 200,
+             grasp_force: float = 1.0, approach_height: float = 0.12,
+             grasp_height: float = 0.02):
+        """Pick sequence following Genesis tutorial pattern:
+          1. Plan path to pre-grasp (above object)
+          2. Plan path to grasp height (collision-free descent)
+          3. Force-control grasp
+          4. Plan path to lift
         """
-        lo, hi = self._q_limit_tensors()
-        gripper_idx = torch.tensor(self.gripper_dofs, dtype=torch.long, device=lo.device)
-        device = lo.device
+        # Phase 1: Plan path to pre-grasp
+        pre_qpos = self.solve_ik(object_pos[0], object_pos[1], object_pos[2] + approach_height)
+        pre_qpos_arr = np.array(pre_qpos)
+        pre_qpos_arr[-2:] = 0.04  # open gripper
+        self.plan_and_execute(pre_qpos_arr.tolist(), num_waypoints)
 
-        # Open gripper
-        self.open_gripper(0.04, steps=100)
+        # Phase 2: Plan path to grasp height (collision-free)
+        grasp_qpos = self.solve_ik(object_pos[0], object_pos[1], object_pos[2] + grasp_height)
+        grasp_arr = np.array(grasp_qpos)
+        grasp_arr[-2:] = 0.04  # keep gripper open during descent
+        self.plan_and_execute(grasp_arr.tolist(), num_waypoints)
 
-        # Teleport above object (safe height, no collision)
-        above_joints = self._solve_ik(object_pos[0], object_pos[1], object_pos[2] + 0.10)
-        self.teleport_arm_to(above_joints)
+        # Phase 3: Force-control grasp (from tutorial)
+        self.close_gripper_force(grasp_force, steps=200)
 
-        # PD descend to grasp height
-        grasp_joints = self._solve_ik(object_pos[0], object_pos[1], object_pos[2] + 0.02)
-        arm_target = torch.clamp(
-            torch.tensor(grasp_joints, dtype=torch.float32, device=device),
-            lo[:self.n_arm], hi[:self.n_arm],
-        )
-        gripper_open = torch.tensor(
-            [0.04] * len(self.gripper_dofs), dtype=torch.float32, device=device,
-        )
-        for _ in range(steps):
-            self.robot.control_dofs_position(arm_target, dofs_idx_local=self.arm_dofs)
-            self.robot.control_dofs_position(gripper_open, dofs_idx_local=self.gripper_dofs)
-            self.scene.step(1)
-
-        # Close gripper while holding arm position
-        gripper_close_target = torch.clamp(
-            torch.tensor([grasp_diameter] * len(self.gripper_dofs), dtype=torch.float32, device=device),
-            lo[gripper_idx], hi[gripper_idx],
-        )
-        for _ in range(steps):
-            self.robot.control_dofs_position(arm_target, dofs_idx_local=self.arm_dofs)
-            self.robot.control_dofs_position(gripper_close_target, dofs_idx_local=self.gripper_dofs)
-            self.scene.step(1)
-
-        # Lift via PD control
-        lift_joints = self._solve_ik(object_pos[0], object_pos[1], object_pos[2] + 0.20)
-        lift_target = torch.clamp(
-            torch.tensor(lift_joints, dtype=torch.float32, device=device),
-            lo[:self.n_arm], hi[:self.n_arm],
-        )
-        for _ in range(steps):
-            self.robot.control_dofs_position(lift_target, dofs_idx_local=self.arm_dofs)
-            self.robot.control_dofs_position(gripper_close_target, dofs_idx_local=self.gripper_dofs)
-            self.scene.step(1)
+        # Phase 4: Plan path to lift
+        lift_qpos = self.solve_ik(object_pos[0], object_pos[1], object_pos[2] + 0.20)
+        lift_list = lift_qpos if isinstance(lift_qpos, list) else lift_qpos.tolist()
+        self.plan_and_execute(lift_list, num_waypoints)
 
     # ── Primitive 5: Place ───────────────────────────────────
 
-    def place(self, target_pos: List[float], steps: int = 300):
-        self.move_above_object(target_pos, height=0.10)
-        self.move_to_object(target_pos, offset_z=self.FINGER_LENGTH)
+    def place(self, target_pos: List[float], num_waypoints: int = 200):
+        """Place sequence: plan to above → descend → open gripper."""
+        # Move above target
+        place_qpos = self.solve_ik(target_pos[0], target_pos[1], target_pos[2] + 0.12)
+        self.plan_and_execute(place_qpos, num_waypoints)
+
+        # Descend
+        descend_qpos = self.solve_ik(target_pos[0], target_pos[1], target_pos[2] + 0.02)
+        self.robot.control_dofs_position(descend_qpos[:-2], dofs_idx_local=self.arm_dofs)
+        self.scene.step(200)
+
         # Open gripper to release
-        self.open_gripper(0.04, steps=steps)
-        self.move_above_object(target_pos, height=0.10)
+        self.open_gripper(0.04, steps=200)
+
+        # Lift away
+        lift_qpos = self.solve_ik(target_pos[0], target_pos[1], target_pos[2] + 0.15)
+        self.plan_and_execute(lift_qpos, num_waypoints)
 
     # ── Pick & Place ─────────────────────────────────────────
 
-    def pick_and_place(self, object_pos: List[float], target_pos: List[float]):
+    def pick_and_place(self, object_pos, target_pos):
         self.pick(object_pos)
         self.place(target_pos)
