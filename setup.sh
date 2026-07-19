@@ -4,7 +4,7 @@
 set -e
 
 echo "=== RoboPilot Environment Setup ==="
-echo "    Qwen3-VL + Genesis + Suction Gripper on AMD ROCm"
+echo "    Qwen3-VL-8B + Genesis + Suction Gripper on AMD ROCm"
 echo ""
 
 # 1. System dependencies
@@ -33,15 +33,22 @@ pip install --index-url http://compute-artifactory.amd.com/artifactory/compute-p
 echo "[5/6] Installing project dependencies..."
 pip install -r requirements.txt -q 2>/dev/null || echo "  Some dependencies skipped"
 
-# 6. Pre-download Qwen3-VL model
-echo "[6/6] Checking Qwen3-VL model..."
-python3 -c "
-from transformers import Qwen3VLForConditionalGeneration, AutoProcessor
-print('  Downloading Qwen3-VL-2B-Instruct...')
-AutoProcessor.from_pretrained('Qwen/Qwen3-VL-2B-Instruct')
-Qwen3VLForConditionalGeneration.from_pretrained('Qwen/Qwen3-VL-2B-Instruct', torch_dtype='auto')
-print('  Qwen3-VL model ready')
-" 2>/dev/null || echo "  Qwen3-VL download skipped (will download on first run)"
+# 6. Start vLLM server for Qwen3-VL-8B
+echo "[6/6] Setting up vLLM server for Qwen3-VL-8B..."
+if curl -s http://localhost:8000/v1/models > /dev/null 2>&1; then
+    echo "  vLLM server already running on port 8000"
+else
+    echo "  Starting vLLM server in background..."
+    VLLM_ROCM_USE_AITER=0 setsid vllm serve Qwen/Qwen3-VL-8B-Instruct \
+        --limit-mm-per-prompt.video 0 \
+        --max-model-len 4096 \
+        --gpu-memory-utilization 0.8 \
+        --enforce-eager \
+        --host 0.0.0.0 --port 8000 \
+        < /dev/null > vllm.log 2>&1 &
+    echo "  vLLM server starting (check vllm.log for status)"
+    echo "  Wait ~30s for model to load, then verify: curl http://localhost:8000/v1/models"
+fi
 
 # Verify
 echo ""
@@ -49,18 +56,19 @@ echo "=== Verifying Environment ==="
 python3 -c "
 import torch
 print(f'  PyTorch:    {torch.__version__}')
-print(f'  CUDA:       {torch.cuda.is_available()}')
-if torch.cuda.is_available():
-    print(f'  GPU:        {torch.cuda.get_device_name(0)}')
-    print(f'  VRAM:       {torch.cuda.get_device_properties(0).total_mem / 1e9:.1f} GB')
+print(f'  GPU:        AMD ROCm (gs.amdgpu)')
 try:
     import genesis
     print(f'  Genesis:    {genesis.__version__}')
 except: print('  Genesis:    not installed')
 try:
-    from transformers import Qwen3VLForConditionalGeneration
-    print(f'  Qwen3-VL:   native class available')
-except: print('  Qwen3-VL:   class not available')
+    import vllm
+    print(f'  vLLM:       {vllm.__version__}')
+except: print('  vLLM:       not installed')
+try:
+    from transformers import AutoModelForImageTextToText
+    print(f'  Transformers: {__import__(\"transformers\").__version__}')
+except: print('  Transformers: not installed')
 "
 
 echo ""
@@ -69,4 +77,7 @@ echo ""
 echo "Run the full demo:"
 echo "  source venv/bin/activate"
 echo "  python3 demo/full_demo.py"
+echo ""
+echo "Run comprehensive E2E test:"
+echo "  python3 demo/test_e2e.py"
 echo ""
