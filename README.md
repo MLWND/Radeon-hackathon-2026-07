@@ -2,7 +2,7 @@
 
 > **Radeon Hackathon 2026-07, Track 3: Physical AI Challenge**
 
-Qwen3-VL (VLM) + Genesis (GPU Physics) + Suction Gripper (Weld Constraint) + AMD ROCm
+Qwen3-VL-8B (VLM) + Genesis (GPU Physics) + Suction Gripper (Weld Constraint) + AMD ROCm
 
 ## Quick Start
 
@@ -13,6 +13,9 @@ bash setup.sh
 # 2. Run full demo
 source venv/bin/activate
 python3 demo/full_demo.py
+
+# 3. Run comprehensive E2E test (all 10 modules)
+python3 demo/test_e2e.py
 ```
 
 ## What It Does
@@ -20,45 +23,58 @@ python3 demo/full_demo.py
 User says: **"Pick the red cube and place it next to the blue cube"**
 
 ```
-Qwen3-VL  →  identifies red_cube, plans placement
-Genesis   →  OMPL path planning, suction pick, place
-Camera    →  verifies before/after, confirms success
+Qwen3-VL-8B (1.8s) → identifies red_cube, plans placement relative to blue_cube
+Genesis       → OMPL plan_path, suction pick (weld), PD place
+Camera        → pixel verify + scene memory + fail detector
 ```
 
-**Full pipeline: ~14s end-to-end on AMD ROCm GPU**
+**Full pipeline: ~9.2s end-to-end on AMD ROCm GPU (excl. one-time setup)**
 
 ## Demo Results
 
 | Metric | Value |
 |--------|-------|
-| VLM Model | Qwen3-VL-2B (native Qwen3VLForConditionalGeneration) |
-| VLM Inference | 6s |
-| Suction Pick | 7s |
-| Suction Place | 0.1s |
-| Placement Error | 5.3cm |
+| VLM Model | Qwen3-VL-8B-Instruct (via vLLM 0.25.1) |
+| VLM Inference | 1.8s |
+| Suction Pick | 6.4s (OMPL + weld + PD lift) |
+| Suction Place | 1.0s (PD descent + unweld) |
+| Placement Error | 0.5cm |
+| Objects Disturbed | 0 |
 | Status | **SUCCESS** |
 
 ## Tech Stack
 
-| Component | Technology |
-|-----------|-----------|
-| VLM | Qwen/Qwen3-VL-2B-Instruct |
-| Physics | Genesis 1.2.2 (gs.amdgpu) |
-| Robot | Franka Panda (MJCF) |
-| Gripper | Suction (weld constraint) |
+| Component | Technology | Version |
+|-----------|-----------|---------|
+| VLM | Qwen/Qwen3-VL-8B-Instruct | vLLM 0.25.1 |
+| Physics | Genesis | 1.2.2 |
+| Robot | Franka Panda (MJCF) | — |
+| Gripper | Suction (weld constraint) | — |
 | GPU | AMD Radeon, ROCm 7.2, 48GB VRAM |
-| Framework | PyTorch 2.9.1+rocm7.2 |
+| Framework | PyTorch | 2.11.0+gitd0c8b1f |
 
-## Key Innovation: Suction Gripper via Weld Constraint
+## Key Innovation: Official Genesis Patterns
 
-Instead of unreliable parallel finger grasp, we use Genesis weld constraints — the official industrial approach:
+All code follows official Genesis examples. Key patterns:
 
-```python
-# Pick: attach object to hand
-scene.rigid_solver.add_weld_constraint(hand_link, object_link)
+- **Ground plane** instead of kinematic table (avoids arm clipping)
+- **RigidOptions(Newton, box_box_detection)** for accurate collision
+- **Weld constraint** suction gripper (shape-agnostic, reliable)
+- **plan_path → control_dofs_position** for collision-free approach
+- **vLLM** for fast VLM inference (~1.8s vs ~6s with native transformers)
 
-# Place: detach object
-scene.rigid_solver.delete_weld_constraint(hand_link, object_link)
+## Architecture
+
+```
+User: "Pick the red cube and place it next to the blue cube"
+  │
+  ├─ Qwen3-VL-8B via vLLM (1.8s)
+  ├─ Scene Memory → Position Resolution
+  ├─ Task Planner → Action Decomposition
+  ├─ OMPL Plan Path → Collision-free Approach
+  ├─ Suction Pick → Weld Constraint + PD Lift (6.4s)
+  ├─ Suction Place → PD Descent + Unweld (1.0s)
+  └─ Verification → Pixel + Scene Memory + Fail Detector (0.1s)
 ```
 
 ## Project Docs
