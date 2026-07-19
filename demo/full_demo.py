@@ -49,21 +49,20 @@ def main():
         show_viewer=False,
     )
     scene.add_entity(gs.morphs.Plane(), surface=gs.surfaces.Rough(color=(0.25, 0.25, 0.25)))
-    scene.add_entity(gs.morphs.Box(size=(0.8, 1.0, 0.05), pos=(0.5, 0, 0.025)),
-                     material=gs.materials.Kinematic(), surface=gs.surfaces.Rough(color=(0.55, 0.55, 0.55)))
+    # NO TABLE — ground plane only (official Genesis tutorial approach)
     robot = scene.add_entity(gs.morphs.MJCF(
         file=os.path.join("venv/lib/python3.12/site-packages/genesis/assets/xml/franka_emika_panda/panda.xml")))
 
-    T, S = 0.05, 0.04
+    S = 0.04  # cube half-size, cubes on ground at z=S
     objects_def = {
-        "red_cube":    (0.60,  0.00, T+S/2, (0.9, 0.15, 0.15)),
-        "blue_cube":   (0.55,  0.20, T+S/2, (0.15, 0.3,  0.9)),
-        "green_cube":  (0.70, -0.10, T+S/2, (0.15, 0.75, 0.2)),
-        "yellow_cube": (0.65,  0.15, T+S/2, (0.95, 0.85, 0.1)),
-        "white_cube":  (0.50, -0.15, T+S/2, (0.9,  0.9,  0.9)),
-        "orange_cube": (0.75,  0.05, T+S/2, (0.9,  0.5,  0.1)),
-        "purple_cube": (0.60, -0.20, T+S/2, (0.6,  0.2,  0.8)),
-        "cyan_cube":   (0.70,  0.20, T+S/2, (0.1,  0.7,  0.8)),
+        "red_cube":    (0.60,  0.00, S, (0.9, 0.15, 0.15)),
+        "blue_cube":   (0.55,  0.20, S, (0.15, 0.3,  0.9)),
+        "green_cube":  (0.70, -0.10, S, (0.15, 0.75, 0.2)),
+        "yellow_cube": (0.65,  0.15, S, (0.95, 0.85, 0.1)),
+        "white_cube":  (0.50, -0.15, S, (0.9,  0.9,  0.9)),
+        "orange_cube": (0.75,  0.05, S, (0.9,  0.5,  0.1)),
+        "purple_cube": (0.60, -0.20, S, (0.6,  0.2,  0.8)),
+        "cyan_cube":   (0.70,  0.20, S, (0.1,  0.7,  0.8)),
     }
     ents = {}
     for name, (x, y, z, c) in objects_def.items():
@@ -72,14 +71,14 @@ def main():
             material=gs.materials.Rigid(),
             surface=gs.surfaces.Smooth(color=c, roughness=0.3))
 
-    # P1-27: Larger goal area
-    scene.add_entity(gs.morphs.Box(size=(0.15, 0.15, 0.002), pos=(0.45, 0, T + 0.001)),
+    # Goal area — on ground plane
+    scene.add_entity(gs.morphs.Box(size=(0.15, 0.15, 0.001), pos=(0.45, 0, 0.001)),
         material=gs.materials.Kinematic(),
         surface=gs.surfaces.Smooth(color=(0.2, 0.5, 1.0, 0.4), roughness=0.1))
 
-    # P1-25: Better camera setup
+    # Camera — 45° side view, lookat at ground level
     camera = scene.add_camera(res=(1280, 720), pos=(1.5, -2.0, 1.6),
-                              lookat=(0.5, 0, 0.08), fov=45)
+                              lookat=(0.5, 0, 0.0), fov=45)
     scene.build()
     scene.step(200)
 
@@ -99,7 +98,7 @@ def main():
     INSTRUCTION = "Pick the red cube and place it in the blue goal area"
     prompt = f"""Analyze this tabletop scene for a robotic pick-and-place task.
 
-Scene: 8 colored cubes on a gray table with a blue goal area at (0.45, 0.0).
+Scene: 8 colored cubes on a gray ground plane with a blue goal area at (0.45, 0.0).
 Available objects: {list(ents.keys())}
 User instruction: {INSTRUCTION}
 
@@ -169,7 +168,7 @@ Output ONLY valid JSON:
     logger.info(f"Lifted: {height_ok} (z={cube_final[2]:.3f})")
 
     # PD Place
-    goal = np.array([0.45, 0.0, T + S/2])
+    goal = np.array([0.45, 0.0, S + 0.01])  # ground level + small offset
     prims.pd_move_to_xyz([goal[0], goal[1], goal[2] + 0.05], steps=300)
     prims.suction_release(pick_name)
 
