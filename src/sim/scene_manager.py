@@ -4,6 +4,7 @@ Genesis scene — Franka Panda + Tabletop Manipulation.
 """
 import genesis as gs
 import numpy as np
+import torch
 import os
 from dataclasses import dataclass
 from typing import Optional, List, Tuple, Dict, Any
@@ -102,12 +103,37 @@ class SceneManager:
         self.objects[name] = cup
         return self
 
-    def add_box(self, name="blue_box", color="blue", pos=(-0.2, 0.15, 0.42)):
+    def add_cube(self, name="red_cube", color="red", pos=(0.65, 0.0, 0.02)):
+        """Add a 4cm cube (matches ManipulationPipeline expectations).
+
+        Pos z should be 0.02 (half of 0.04 height) so cube sits on ground plane.
+        """
+        return self._add_box_named(name, color, size=(0.04, 0.04, 0.04), pos=pos)
+
+    def add_box(self, name="blue_box", color="blue", pos=(-0.2, 0.15, 0.42), size=(0.1, 0.1, 0.07)):
         box = self.scene.add_entity(
-            gs.morphs.Box(size=(0.1, 0.1, 0.07), pos=pos),
+            gs.morphs.Box(size=size, pos=pos),
             material=gs.materials.Rigid(),
         )
         self.objects[name] = box
+        return self
+
+    def _add_box_named(self, name, color, size, pos):
+        color_map = {"red": (1,0,0), "blue": (0,1,0), "green": (0,0,1),
+                     "yellow": (1,1,0), "orange": (1,0.6,0), "purple": (0.7,0,0.8),
+                     "cyan": (0,1,1), "white": (1,1,1)}
+        surf_color = color_map.get(color.lower(), (0.5,0.5,0.5))
+        try:
+            cube = self.scene.add_entity(
+                gs.morphs.Box(size=size, pos=pos),
+                surface=gs.surfaces.Plastic(color=surf_color),
+            )
+        except Exception:
+            cube = self.scene.add_entity(
+                gs.morphs.Box(size=size, pos=pos),
+                material=gs.materials.Rigid(),
+            )
+        self.objects[name] = cube
         return self
 
     def add_sphere(self, name="apple", radius=0.03, pos=(0.2, -0.15, 0.41)):
@@ -281,15 +307,15 @@ def create_tabletop_scene(show_viewer=False) -> SceneManager:
     )
 
     # Cubes on ground plane (no table!)
-    S = 0.04  # cube half-size
-    scene.add_box("red_cube", pos=(0.60, 0.00, S))
-    scene.add_box("blue_cube", pos=(0.55, 0.20, S))
-    scene.add_box("green_cube", pos=(0.70, -0.10, S))
-    scene.add_box("yellow_cube", pos=(0.65, 0.15, S))
-    scene.add_box("white_cube", pos=(0.50, -0.15, S))
-    scene.add_box("orange_cube", pos=(0.75, 0.05, S))
-    scene.add_box("purple_cube", pos=(0.60, -0.20, S))
-    scene.add_box("cyan_cube", pos=(0.70, 0.20, S))
+    S = 0.04  # cube size (4cm)
+    scene.add_cube("red_cube", color="red", pos=(0.60, 0.00, S/2))
+    scene.add_cube("blue_cube", color="blue", pos=(0.55, 0.20, S/2))
+    scene.add_cube("green_cube", color="green", pos=(0.70, -0.10, S/2))
+    scene.add_cube("yellow_cube", color="yellow", pos=(0.65, 0.15, S/2))
+    scene.add_cube("white_cube", color="white", pos=(0.50, -0.15, S/2))
+    scene.add_cube("orange_cube", color="orange", pos=(0.75, 0.05, S/2))
+    scene.add_cube("purple_cube", color="purple", pos=(0.60, -0.20, S/2))
+    scene.add_cube("cyan_cube", color="cyan", pos=(0.70, 0.20, S/2))
 
     scene.add_camera()
     scene.build()
