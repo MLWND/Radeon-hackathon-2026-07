@@ -57,6 +57,11 @@ class SceneManager:
                 dt=self.config.dt,
                 gravity=self.config.gravity,
             ),
+            # Official pattern: box_box_detection + Newton constraint solver
+            rigid_options=gs.options.RigidOptions(
+                box_box_detection=True,
+                constraint_solver=gs.constraint_solver.Newton,
+            ),
             viewer_options=gs.options.ViewerOptions(
                 camera_pos=(3.5, 0, 2),
                 camera_lookat=(0, 0, 0.5),
@@ -162,6 +167,49 @@ class SceneManager:
 
     def settle(self, steps=100):
         self.step(steps)
+
+    # ── Domain Randomization (from official examples) ──────
+
+    def apply_domain_randomization(self, robot):
+        """Apply per-environment physics randomization (official pattern)."""
+        n = self.scene.n_envs
+        # Friction randomization
+        robot.set_friction_ratio(
+            friction_ratio=0.5 + torch.rand(n, robot.n_links),
+            links_idx_local=np.arange(0, robot.n_links),
+        )
+        # Mass shift randomization
+        robot.set_mass_shift(
+            mass_shift=-0.5 + torch.rand(n, robot.n_links),
+            links_idx_local=np.arange(0, robot.n_links),
+        )
+        # COM shift randomization
+        robot.set_COM_shift(
+            com_shift=-0.05 + 0.1 * torch.rand(n, robot.n_links, 3),
+            links_idx_local=np.arange(0, robot.n_links),
+        )
+        print(f"  Domain randomization applied: friction, mass, COM")
+
+    # ── Object Reset (from official grasp_env.py) ──────────
+
+    def reset_object(self, obj, pos, quat=None):
+        """Reset object position (official pattern with skip_forward)."""
+        pos_tensor = torch.tensor(pos, dtype=torch.float32, device=gs.device)
+        if quat is not None:
+            quat_tensor = torch.tensor(quat, dtype=torch.float32, device=gs.device)
+            obj.set_pos(pos_tensor, skip_forward=True)
+            obj.set_quat(quat_tensor, skip_forward=False)
+        else:
+            obj.set_pos(pos_tensor, skip_forward=True)
+            self.scene.step(1)
+
+    def reset_objects_random(self, objects_dict, x_range=(0.2, 0.6), y_range=(-0.25, 0.25)):
+        """Reset all objects to random positions on ground plane."""
+        for name, obj in objects_dict.items():
+            x = np.random.uniform(*x_range)
+            y = np.random.uniform(*y_range)
+            z = 0.02  # ground + half height
+            self.reset_object(obj, [x, y, z])
 
     # ── Camera ───────────────────────────────────────────────
 
