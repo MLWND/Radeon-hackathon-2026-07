@@ -54,6 +54,10 @@ def main():
     print("\n[4/8] Init Manipulation Pipeline...")
     from src.control.primitives import ManipulationPipeline
     pipe = ManipulationPipeline(robot, scene, ents)
+    pipe.setup_stereo_cameras(image_size=(64, 64))
+    print(f"  Stereo: {'enabled' if pipe.left_cam else 'mono fallback'}")
+    pipe.reset()  # Episode reset to home pose
+    print("  Episode reset to home pose")
 
     # ═══ 5. CLOSED LOOP ═════════════════════════════════════
     header("Step 5: Closed-Loop Execution")
