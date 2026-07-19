@@ -84,13 +84,13 @@ class ManipulationPipeline:
         }
 
     def is_done(self):
-        """Episode done when object placed near target."""
+        """Episode done when object on ground near target."""
         if self._current_object is None or self._current_target is None:
             return False
         obj = self.entities[self._current_object]
         obj_pos = self._to_numpy(obj.get_pos())
-        err = np.linalg.norm(obj_pos[:2] - np.array(self._current_target)[:2])
-        # Also check object is on ground (not held)
+        err = float(np.linalg.norm(obj_pos[:2] - np.array(self._current_target)[:2]))
+        # Object must be on ground (released) AND within 10cm of target
         on_ground = obj_pos[2] < 0.05
         return err < 0.10 and on_ground
 
@@ -105,7 +105,7 @@ class ManipulationPipeline:
             pos=target,
             quat=np.array([0, 1, 0, 0]),
         )
-        # Step 2: FK verify
+        # Step 2: FK verify (non-destructive: saves+restores current qpos)
         fk_err = self._fk_verify(qpos, target)
         if fk_err < tol:
             return qpos
@@ -115,11 +115,11 @@ class ManipulationPipeline:
         return qpos_fb if fk_err_fb < fk_err else qpos
 
     def _fk_verify(self, qpos, target):
-        """Compute FK error (without stepping). Returns Euclidean distance."""
+        """Compute FK error (without disturbing sim state). Saves+restores qpos."""
         cur = self._to_numpy(self.robot.get_qpos())
         self.robot.set_qpos(qpos)
         ee_pos = self._to_numpy(self.robot.get_links_pos()[self.ee_idx])
-        self.robot.set_qpos(cur)  # restore
+        self.robot.set_qpos(cur)  # restore immediately
         return float(np.linalg.norm(ee_pos - target))
 
     def _jacobian_dls_ik(self, target, qpos_init, max_iter=50, lam=0.01, tol=0.005):
@@ -267,6 +267,47 @@ class ManipulationPipeline:
             rgb_left = rgb_left / 255.0
             rgb_right = rgb_right / 255.0
         return torch.cat([rgb_left, rgb_right], dim=1)
+
+    # ── Action Dispatcher (driven by ActionScheduler) ──────────
+
+    def execute_action(self, action: Dict, target_pos: Optional[list] = None):
+        """Dispatch one action dict to the right primitive.
+
+        This is the bridge from ActionScheduler to ManipulationPipeline.
+        Returns per-action result; pick/place bool/float, None for unknown.
+        """
+        act = action.get("action", "").lower()
+        obj = action.get("object", "")
+        tgt = action.get("target", "")
+        if act == "pick":
+            if obj in self.entities:
+                return {"ok": True, "result": self.suction_pick(obj)}
+            return {"ok": False, "result": False, "reason": f"unknown object {obj}"}
+        if act == "place":
+            if obj == "":
+                obj = self._current_object or list(self.entities.keys())[0]
+            if obj not in self.entities:
+                return {"ok": False, "result": 0.99, "reason": f"unknown object {obj}"}
+            # Resolve target_pos: explicit, or from scene memory
+            if target_pos is not None:
+                tp = target_pos
+            elif tgt in self.entities:
+                tp = self._to_numpy(self.entities[tgt].get_pos()).tolist()
+            else:
+                tp = [0.55, 0.0, 0.02]
+            return {"ok": True, "result": self.suction_place(obj, tp)}
+        if act == "move_above":
+            name = obj or tgt
+            if name in self.entities:
+                pos = self._to_numpy(self.entities[name].get_pos())
+                q = self.solve_ik(pos[0], pos[1], pos[2] + action.get("height", 0.18))
+                self._pd_hold_and_check(q[:-2], 50)
+                return {"ok": True, "result": True}
+            return {"ok": False, "result": False}
+        if act == "wait" or act == "settle":
+            self.scene.step(action.get("steps", 50))
+            return {"ok": True, "result": True}
+        return {"ok": False, "result": None, "reason": f"unknown action {act}"}
 
     # ── Object Reset ───────────────────────────────────────────
 
