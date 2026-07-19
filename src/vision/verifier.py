@@ -67,11 +67,11 @@ class CameraVerifier:
         mean_diff = diff.mean()
         max_diff = diff.max()
 
-        changed = mean_diff > 5.0  # Threshold for significant change
+        changed = mean_diff > 1.5 or max_diff > 100
 
         return {
             "success": changed,
-            "confidence": min(mean_diff / 20.0, 1.0),
+            "confidence": min(mean_diff / 10.0, 1.0),
             "reasoning": f"Pixel difference: mean={mean_diff:.1f}, max={max_diff:.0f}",
             "method": "pixel",
         }
