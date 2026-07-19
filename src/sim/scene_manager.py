@@ -219,26 +219,29 @@ TABLE_TOP = TABLE_HEIGHT  # table top z (bottom at z=0)
 
 
 def create_tabletop_scene(show_viewer=False) -> SceneManager:
+    """Ground plane + cubes on ground (official Genesis tutorial approach).
+    
+    No kinematic table — it causes arm clipping during PD control.
+    Cubes rest directly on ground plane at z = half_height.
+    """
     config = SceneConfig(show_viewer=show_viewer, robot_pos=(0, 0, 0.35))
     scene = (
         SceneManager(config)
         .init_genesis()
         .add_ground()
-        .add_table(size=(0.8, 1.0, 0.05), pos=(0.5, 0, 0.025))
         .add_robot(use_mjcf=True)
     )
 
-    # 8 objects on Kinematic table. Table top at z=0.05.
-    # Suction gripper works best with cubes and simple shapes.
-    table_top = 0.05
-    scene.add_box("red_cube", pos=(0.6, 0.0, table_top + 0.02))
-    scene.add_box("blue_cube", pos=(0.55, 0.2, table_top + 0.02))
-    scene.add_cup("green_cup", pos=(0.7, -0.1, table_top + 0.04))
-    scene.add_bottle("yellow_bottle", pos=(0.6, -0.2, table_top + 0.075))
-    scene.add_box("white_cube", pos=(0.65, 0.1, table_top + 0.02))
-    scene.add_box("orange_cube", pos=(0.75, 0.15, table_top + 0.02))
-    scene.add_sphere("red_apple", radius=0.03, pos=(0.55, -0.1, table_top + 0.03))
-    scene.add_sphere("blue_ball", radius=0.02, pos=(0.7, -0.15, table_top + 0.02))
+    # Cubes on ground plane (no table!)
+    S = 0.04  # cube half-size
+    scene.add_box("red_cube", pos=(0.60, 0.00, S))
+    scene.add_box("blue_cube", pos=(0.55, 0.20, S))
+    scene.add_box("green_cube", pos=(0.70, -0.10, S))
+    scene.add_box("yellow_cube", pos=(0.65, 0.15, S))
+    scene.add_box("white_cube", pos=(0.50, -0.15, S))
+    scene.add_box("orange_cube", pos=(0.75, 0.05, S))
+    scene.add_box("purple_cube", pos=(0.60, -0.20, S))
+    scene.add_box("cyan_cube", pos=(0.70, 0.20, S))
 
     scene.add_camera()
     scene.build()
