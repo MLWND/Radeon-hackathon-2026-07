@@ -29,7 +29,7 @@ def main():
     )
     scene.add_entity(gs.morphs.Plane())
     robot = scene.add_entity(gs.morphs.MJCF(file=os.path.join(
-        "venv/lib/python3.12/site-packages/genesis/assets/xml/franka_emika_panda/panda.xml")), vis_mode="collision")
+        "venv/lib/python3.12/site-packages/genesis/assets/xml/franka_emika_panda/panda.xml")))
 
     ents = {}
     ents["red_cube"] = scene.add_entity(gs.morphs.Box(size=(0.04,0.04,0.04), pos=(0.65,0.0,0.02)),
