@@ -43,6 +43,48 @@ class ManipulationPipeline:
             np.array([87, 87, 87, 87, 12, 12, 12, 100, 100]),
         )
 
+        # Track object states for reset
+        self.original_positions = {}
+        for name, ent in self.entities.items():
+            self.original_positions[name] = self._to_numpy(ent.get_pos()).copy()
+
+    # ── Stereo Camera (from official grasp_env.py) ──────────
+
+    def setup_stereo_cameras(self, image_size=(64, 64)):
+        """Setup stereo cameras for VLM (official pattern)."""
+        try:
+            from genesis.options.sensors import RasterizerCameraOptions
+            self.left_cam = self.scene.add_sensor(
+                RasterizerCameraOptions(
+                    res=(image_size[0], image_size[1]),
+                    pos=(1.25, 0.3, 0.3),
+                    lookat=(0.0, 0.0, 0.0),
+                    fov=60,
+                ))
+            self.right_cam = self.scene.add_sensor(
+                RasterizerCameraOptions(
+                    res=(image_size[0], image_size[1]),
+                    pos=(1.25, -0.3, 0.3),
+                    lookat=(0.0, 0.0, 0.0),
+                    fov=60,
+                ))
+            print(f"  Stereo cameras: {image_size[0]}x{image_size[1]}")
+        except Exception as e:
+            print(f"  Stereo camera setup failed: {e}")
+
+    def get_stereo_rgb(self, normalize=True):
+        """Get stereo RGB images (official pattern)."""
+        if not hasattr(self, 'left_cam'):
+            return None
+        rgb_left = self.left_cam.read().rgb
+        rgb_right = self.right_cam.read().rgb
+        rgb_left = rgb_left.permute(0, 3, 1, 2).float()
+        rgb_right = rgb_right.permute(0, 3, 1, 2).float()
+        if normalize:
+            rgb_left = rgb_left / 255.0
+            rgb_right = rgb_right / 255.0
+        return torch.cat([rgb_left, rgb_right], dim=1)
+
     # ── IK (official pattern) ───────────────────────────────
 
     def solve_ik(self, x, y, z):
@@ -128,6 +170,16 @@ class ManipulationPipeline:
         final = obj.get_pos().cpu().numpy()
         error = np.sqrt((final[0] - tp[0])**2 + (final[1] - tp[1])**2)
         return error
+
+    # ── Reset (from official grasp_env.py) ──────────────────
+
+    def reset_objects(self):
+        """Reset objects to original positions (official pattern)."""
+        for name, orig_pos in self.original_positions.items():
+            if name in self.entities:
+                pos_tensor = torch.tensor(orig_pos, dtype=torch.float32, device=gs.device)
+                self.entities[name].set_pos(pos_tensor, skip_forward=True)
+        self.scene.step(10)
 
     # ── Helper ──────────────────────────────────────────────
 
