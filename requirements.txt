@@ -8,8 +8,15 @@ genesis-world @ git+https://github.com/Genesis-Embodied-AI/Genesis.git@817debb74
 transformers>=4.57
 accelerate
 
-# GPU (ROCm — installed via AMD wheel repo in setup.sh)
-# torch, torchvision, torchaudio — see setup.sh
+# vLLM (VLM inference server)
+vllm>=0.25
+
+# Vision
+opencv-python-headless
+imageio[ffmpeg]
+
+# OpenAI-compatible API (for vLLM)
+openai
 
 # Core
 numpy
