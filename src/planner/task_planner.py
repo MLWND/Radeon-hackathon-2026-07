@@ -148,7 +148,14 @@ class TaskPlanner:
 
     def _find_object(self, text: str) -> str:
         objects = [
-            ("red cup", ["red cup", "cup", "红色杯子", "杯子"]),
+            ("red_cube", ["red cube", "red_cube", "red cup", "cup", "红色", "杯子", "red"]),
+            ("blue_cube", ["blue cube", "blue_cube", "blue cup", "蓝色", "blue"]),
+            ("green_cube", ["green cube", "green_cube", "绿色", "green"]),
+            ("yellow_cube", ["yellow cube", "yellow_cube", "黄色", "yellow"]),
+            ("orange_cube", ["orange cube", "orange_cube", "橙色", "orange"]),
+            ("purple_cube", ["purple cube", "purple_cube", "紫色", "purple"]),
+            ("cyan_cube", ["cyan cube", "cyan_cube", "青色", "cyan"]),
+            ("white_cube", ["white cube", "white_cube", "白色", "white"]),
             ("apple", ["apple", "苹果"]),
             ("bottle", ["bottle", "瓶子"]),
         ]
@@ -156,18 +163,20 @@ class TaskPlanner:
             for kw in keywords:
                 if kw in text:
                     return name
-        return "red cup"
+        return "red_cube"
 
     def _find_target(self, text: str) -> str:
         targets = [
-            ("blue box", ["blue box", "box", "蓝色盒子", "盒子"]),
+            ("blue_cube", ["blue cube", "blue_cube", "blue box", "蓝色", "blue"]),
+            ("red_cube", ["red cube", "red_cube", "red", "红色"]),
+            ("green_cube", ["green cube", "green_cube", "green", "绿色"]),
             ("table", ["table", "桌子"]),
         ]
         for name, keywords in targets:
             for kw in keywords:
                 if kw in text:
                     return name
-        return "blue box"
+        return "blue_cube"
 
     def _parse_json(self, response: str) -> Dict:
         try:
