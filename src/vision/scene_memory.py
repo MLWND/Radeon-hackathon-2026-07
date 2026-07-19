@@ -94,6 +94,18 @@ class SceneMemory:
             return "red"
         elif "blue" in name_lower or "box" in name_lower:
             return "blue"
+        elif "green" in name_lower:
+            return "green"
+        elif "yellow" in name_lower:
+            return "yellow"
+        elif "orange" in name_lower:
+            return "orange"
+        elif "purple" in name_lower:
+            return "purple"
+        elif "cyan" in name_lower:
+            return "cyan"
+        elif "white" in name_lower:
+            return "white"
         elif "apple" in name_lower:
             return "red"
         elif "bottle" in name_lower:
