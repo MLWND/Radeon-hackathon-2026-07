@@ -214,6 +214,10 @@ def main():
     log.log("ManipPipeline", "Initializing manipulation pipeline...")
     from src.control.primitives import ManipulationPipeline
     pipe = ManipulationPipeline(robot, scene, ents)
+    pipe.setup_stereo_cameras(image_size=(64, 64))
+    log.log("ManipPipeline", f"Stereo cameras: {'enabled' if pipe.left_cam else 'mono fallback'}")
+    pipe.reset()
+    log.log("ManipPipeline", "Episode reset (robot to home, objects to original)")
 
     # Record pre-pick positions
     pre_pick_pos = {}
@@ -370,6 +374,45 @@ def main():
     cv2.line(canvas, (w, 0), (w, h), (100, 100, 100), 2)
     Image.fromarray(canvas).save("demo/output/test_comparison.png")
     log.log("Output", "Files saved: test_before.png, test_after.png, test_comparison.png, test_e2e.mp4")
+
+    # ═════════════════════════════════════════════════════════
+    # MODULE 11: Triple Verification (structured JSON)
+    # ═════════════════════════════════════════════════════════
+    triple_verify = {
+        "task": INSTRUCTION,
+        "vlm_decision": {"pick": pick_name, "place_relative": place_relative, "inference_ms": round(vlm_ms)},
+        "grasp_verification": {
+            "method": "object_height_change",
+            "z_before": round(float(pre_pick_pos[pick_name][2]), 4),
+            "z_after_pick": round(float(post_pick_pos[pick_name][2]), 4),
+            "lifted": bool(grasp_ok),
+        },
+        "placement_verification": {
+            "method": "euclidean_xy",
+            "target": [round(x, 3) for x in place_pos],
+            "final": [round(float(x), 3) for x in cube_final],
+            "error_cm": round(err * 100, 2),
+            "passed": bool(place_ok),
+        },
+        "disturbance_verification": {
+            "method": "object_position_delta",
+            "disturbed": [{"name": n, "delta_cm": round(d*100, 2)} for n, d in disturbed],
+            "passed": len(disturbed) == 0,
+        },
+        "camera_verification": {
+            "method": "pixel_diff",
+            "success": bool(verify_cam["success"]),
+            "mean_diff": verify_cam.get("reasoning", ""),
+        },
+        "overall_status": overall,
+    }
+    json_out = json.dumps(triple_verify, indent=2, default=float)
+    with open("demo/output/verification.json", "w") as f:
+        f.write(json_out)
+    log.log("TripleVerify", "Structured JSON saved", file="demo/output/verification.json")
+    print("\n  Triple Verification JSON:")
+    print(json_out)
+
 
     # ═════════════════════════════════════════════════════════
     # FINAL SUMMARY
