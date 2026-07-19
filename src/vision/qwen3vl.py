@@ -133,7 +133,7 @@ class QwenVLWrapper:
         return self.last_inference_time
 
 
-def resolve_place_position(place_relative: str, objects: dict, table_top=0.05, cube_size=0.04):
+def resolve_place_position(place_relative: str, objects: dict, table_top=0.0, cube_size=0.04):
     """Convert relative description to exact Genesis coordinates.
 
     Uses scene memory (object positions) for precise placement.
@@ -149,18 +149,18 @@ def resolve_place_position(place_relative: str, objects: dict, table_top=0.05, c
 
     if ref_name and ref_name in objects:
         ref_pos = objects[ref_name].get_pos().cpu().numpy()
+        gap = cube_size * 1.5  # 6cm — one cube width + small gap
         # Place next to reference object
         if "right" in lower or "east" in lower:
-            return [ref_pos[0] + 0.1, ref_pos[1], table_top + cube_size / 2]
+            return [ref_pos[0] + gap, ref_pos[1], table_top + cube_size / 2]
         elif "left" in lower or "west" in lower:
-            return [ref_pos[0] - 0.1, ref_pos[1], table_top + cube_size / 2]
+            return [ref_pos[0] - gap, ref_pos[1], table_top + cube_size / 2]
         elif "behind" in lower or "north" in lower:
-            return [ref_pos[0], ref_pos[1] + 0.1, table_top + cube_size / 2]
+            return [ref_pos[0], ref_pos[1] + gap, table_top + cube_size / 2]
         elif "front" in lower or "south" in lower:
-            return [ref_pos[0], ref_pos[1] - 0.1, table_top + cube_size / 2]
+            return [ref_pos[0], ref_pos[1] - gap, table_top + cube_size / 2]
         else:
-            # Default: place to the right of reference
-            return [ref_pos[0] + 0.1, ref_pos[1], table_top + cube_size / 2]
+            return [ref_pos[0] + gap, ref_pos[1], table_top + cube_size / 2]
 
     # Default: center of table
     return [0.55, 0.0, table_top + cube_size / 2]
