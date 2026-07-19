@@ -233,8 +233,10 @@ def main():
 
     action = scheduler.next_action()  # pick action
     log.log("ActionScheduler", f"  Executing: {action}", progress=str(scheduler.get_progress()))
-
-    lifted = pipe.suction_pick(pick_name)
+    # Drive ManipPipeline via the scheduler output (true closed loop)
+    pick_result = pipe.execute_action(action)
+    lifted = pick_result["result"] if pick_result.get("ok") else False
+    pick_name = action.get("object", pick_name)  # honor planner decision
     pick_ms = (time.time() - t0) * 1000
     scheduler.mark_done(action)
 
@@ -263,10 +265,14 @@ def main():
 
     action = scheduler.next_action()  # place action
     log.log("ActionScheduler", f"  Executing: {action}", progress=str(scheduler.get_progress()))
-
-    err = pipe.suction_place(pick_name, place_pos)
+    place_result = pipe.execute_action(action, target_pos=place_pos)
+    err = place_result["result"] if place_result.get("ok") else 0.99
     place_ms = (time.time() - t0) * 1000
     scheduler.mark_done(action)
+
+    # Episode-completion check (true end-to-end state machine)
+    done = pipe.is_done()
+    log.log("ManipPipeline", f"  is_done={done}")
 
     cube_final = ents[pick_name].get_pos().cpu().numpy()
     log.log("ManipPipeline", f"  PLACE done",
