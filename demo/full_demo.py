@@ -1,135 +1,264 @@
 #!/usr/bin/env python3
 """
-RoboPilot — Full Closed-Loop Demo
-Qwen3-VL real-time detection → Auto planning → Suction pick → Place → Verify
+RoboPilot — Full Closed-Loop Demo (Complete Pipeline)
+
+Pipeline: GraspEnv → VLM perception → Task decomposition → Action scheduling → Execute → Verify
+
+Note: TaskPlanner uses rule-based keyword matching for instruction decomposition.
+VLM (Qwen3-VL) handles object detection and spatial grounding.
 """
 import genesis as gs
 import numpy as np
 import torch
 import json, time, os, sys
+
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 os.makedirs("demo/output", exist_ok=True)
 
-def header(t): print(f"\n{'='*60}\n  {t}\n{'='*60}")
+
+def header(t):
+    print(f"\n{'='*60}\n  {t}\n{'='*60}")
 
 
 def main():
-    header("RoboPilot — Closed-Loop Demo")
+    header("RoboPilot — Full Pipeline Demo")
 
-    # ═══ 1. INIT ════════════════════════════════════════════
-    print("\n[1/8] Init...")
+    # ═══ 1. INIT GRASP ENV ═════════════════════════════════════
+    print("\n[1/9] Init Genesis + GraspEnv...")
     gs.init(backend=gs.amdgpu)
 
-    # ═══ 2. SCENE ════════════════════════════════════════════
-    print("\n[2/8] Build Scene...")
-    scene = gs.Scene(
-        sim_options=gs.options.SimOptions(dt=0.01),
-        rigid_options=gs.options.RigidOptions(box_box_detection=True, constraint_solver=gs.constraint_solver.Newton),
-        show_viewer=False,
-    )
-    scene.add_entity(gs.morphs.Plane())
-    robot = scene.add_entity(gs.morphs.MJCF(file=os.path.join(
-        "venv/lib/python3.12/site-packages/genesis/assets/xml/franka_emika_panda/panda.xml")))
+    from src.envs.grasp_env import GraspEnv
+    env = GraspEnv(num_envs=0, ctrl_dt=0.01)
+    print(f"  Robot: {env.robot.n_dofs} DOFs")
+    print(f"  Objects: {list(env.entities.keys())}")
+    print(f"  Stereo: {'enabled' if env.left_cam else 'mono fallback'}")
 
-    ents = {}
-    ents["red_cube"] = scene.add_entity(gs.morphs.Box(size=(0.04,0.04,0.04), pos=(0.65,0.0,0.02)),
-        surface=gs.surfaces.Plastic(color=(1,0,0)))
-    ents["blue_cube"] = scene.add_entity(gs.morphs.Box(size=(0.04,0.04,0.04), pos=(0.4,0.2,0.02)),
-        surface=gs.surfaces.Plastic(color=(0,1,0)))
-    ents["green_cube"] = scene.add_entity(gs.morphs.Box(size=(0.04,0.04,0.04), pos=(0.7,-0.1,0.02)),
-        surface=gs.surfaces.Plastic(color=(0,0,1)))
-
-    camera = scene.add_camera(res=(1280,720), pos=(1.5,-2.0,1.6), lookat=(0.5,0,0.0), fov=45)
-    scene.build(); scene.step(200)
-    print(f"  3 cubes on ground plane")
-
-    # ═══ 3. VLM ═════════════════════════════════════════════
-    print("\n[3/8] Load Qwen3-VL...")
+    # ═══ 2. VLM (via vLLM OpenAI API) ═════════════════════════
+    print("\n[2/9] Connect to Qwen3-VL via vLLM...")
     from openai import OpenAI
     from PIL import Image
     import base64, io
+
     vlm_client = OpenAI(api_key="EMPTY", base_url="http://localhost:8000/v1", timeout=60)
 
-    # ═══ 4. PIPELINE ═══════════════════════════════════════
-    print("\n[4/8] Init Manipulation Pipeline...")
-    from src.control.primitives import ManipulationPipeline
-    pipe = ManipulationPipeline(robot, scene, ents)
-    pipe.setup_stereo_cameras(image_size=(64, 64))
-    print(f"  Stereo: {'enabled' if pipe.left_cam else 'mono fallback'}")
-    pipe.reset()  # Episode reset to home pose
-    print("  Episode reset to home pose")
+    # ═══ 3. PIPELINE MODULES ══════════════════════════════════
+    print("\n[3/9] Init pipeline modules...")
+    from src.vision.camera import CameraWrapper
+    from src.vision.scene_memory import SceneMemory
+    from src.vision.verifier import CameraVerifier
+    from src.planner.task_planner import TaskPlanner
+    from src.planner.action_scheduler import ActionScheduler
+    from src.planner.recovery import FailureDetector, RecoveryManager
+    from src.vision.qwen3vl import resolve_place_position
 
-    # ═══ 5. CLOSED LOOP ═════════════════════════════════════
-    header("Step 5: Closed-Loop Execution")
+    cam = CameraWrapper(env.vis_cam)
+    memory = SceneMemory()
+    memory.initialize(env.entities)
+    verifier = CameraVerifier()
+    planner = TaskPlanner()
+    scheduler = ActionScheduler()
+    fail_detector = FailureDetector(memory)
+    recovery_manager = RecoveryManager(memory)
 
-    # Capture scene
-    print("  [5a] Capture scene...")
-    img_before = camera.render()[0]
+    # ═══ 4. CAPTURE BEFORE ════════════════════════════════════
+    print("\n[4/9] Capture scene...")
+    img_before = cam.render()
+    cam.render_and_save("demo/output/full_before.png")
+
+    pre_pos = {}
+    for name, obj in env.entities.items():
+        pre_pos[name] = obj.get_pos().cpu().numpy().copy()
+
+    # ═══ 5. VLM DETECT ════════════════════════════════════════
+    header("Step 5: VLM Perception")
+    INSTRUCTION = "Pick the red cube and place it next to the blue cube"
+
     pil_img = Image.fromarray(img_before)
-    buf = io.BytesIO(); pil_img.save(buf, format="PNG")
+    buf = io.BytesIO()
+    pil_img.save(buf, format="PNG")
     b64 = base64.b64encode(buf.getvalue()).decode()
 
-    # VLM detect
-    print("  [5b] Qwen3-VL detect target...")
-    INSTRUCTION = "Pick the red cube and place it next to the blue cube"
+    print(f"  Instruction: {INSTRUCTION}")
     t0 = time.time()
-    response = vlm_client.chat.completions.create(model="Qwen/Qwen3-VL-8B-Instruct",
-        messages=[{"role":"user","content":[
-            {"type":"image_url","image_url":{"url":f"data:image/png;base64,{b64}"}},
-            {"type":"text","text":f'Return ONLY JSON: {{"pick":"name"}}\nObjects: {list(ents.keys())}\nInstruction: {INSTRUCTION}'}
-        ]}], max_tokens=32)
-    vlm_ms = (time.time()-t0)*1000
+    response = vlm_client.chat.completions.create(
+        model="Qwen/Qwen3-VL-8B-Instruct",
+        messages=[{"role": "user", "content": [
+            {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b64}"}},
+            {"type": "text", "text": (
+                f'Return ONLY JSON: {{"pick":"name","place_relative":"description","reasoning":"brief"}}\n'
+                f'Objects: {list(env.entities.keys())}\nInstruction: {INSTRUCTION}'
+            )},
+        ]}],
+        max_tokens=64,
+    )
+    vlm_ms = (time.time() - t0) * 1000
     raw = response.choices[0].message.content
+
     pick_name = "red_cube"
-    try: pick_name = json.loads(raw[raw.rfind("{"):raw.rfind("}")+1]).get("pick","red_cube")
-    except: pass
-    print(f"  VLM: {vlm_ms:.0f}ms → pick={pick_name}")
+    place_relative = "right of blue_cube"
+    reasoning = ""
+    try:
+        s = raw.rfind("{")
+        e = raw.rfind("}") + 1
+        parsed = json.loads(raw[s:e])
+        pick_name = parsed.get("pick", "red_cube")
+        place_relative = parsed.get("place_relative", "right of blue_cube")
+        reasoning = parsed.get("reasoning", "")
+        if pick_name not in env.entities:
+            pick_name = "red_cube"
+    except Exception:
+        pass
 
-    # Pick
-    print("  [5c] Suction pick...")
-    lifted = pipe.suction_pick(pick_name)
-    cube_pos = ents[pick_name].get_pos().cpu().numpy()
-    print(f"  Lifted: {lifted} | Cube: [{cube_pos[0]:.3f},{cube_pos[1]:.3f},{cube_pos[2]:.3f}]")
+    place_pos = resolve_place_position(place_relative, env.entities)
+    print(f"  VLM: {vlm_ms:.0f}ms")
+    print(f"  pick={pick_name}, place_relative={place_relative}")
+    print(f"  place_pos=[{place_pos[0]:.3f}, {place_pos[1]:.3f}, {place_pos[2]:.3f}]")
 
-    # Place
-    print("  [5d] Suction place at goal...")
-    goal = [0.4, 0.2, 0.02]
-    err = pipe.suction_place(pick_name, goal)
-    cube_final = ents[pick_name].get_pos().cpu().numpy()
-    print(f"  Error: {err*100:.1f}cm | Cube: [{cube_final[0]:.3f},{cube_final[1]:.3f},{cube_final[2]:.3f}]")
+    # ═══ 6. TASK PLANNER → ACTION SCHEDULER ═══════════════════
+    header("Step 6: Plan & Schedule")
+    plan = planner.plan(INSTRUCTION, img_before)
+    print(f"  Planner: {plan.get('reasoning', '')[:80]}")
 
-    # Verify
-    print("  [5e] Verify other objects...")
-    for name, obj in ents.items():
+    action_steps = plan.get("steps", [
+        {"action": "pick", "object": pick_name},
+        {"action": "place", "target": "blue_cube"},
+    ])
+    scheduler.load_plan(action_steps)
+    print(f"  {len(action_steps)} steps scheduled")
+    for i, step in enumerate(action_steps):
+        print(f"    {i+1}. {step['action']} → {step.get('object', step.get('target', ''))}")
+
+    # ═══ 7. EXECUTE VIA GRASP ENV ═════════════════════════════
+    header("Step 7: Execute")
+
+    env.start_recording()
+    results = []
+
+    while not scheduler.is_complete():
+        action = scheduler.next_action()
+        if action is None:
+            break
+        act_type = action.get("action", "")
+        obj_name = action.get("object", "")
+        tgt_name = action.get("target", "")
+        print(f"\n  >> {act_type}: {obj_name or tgt_name}")
+
+        # Use RecoveryManager for pick and place actions
+        if act_type in ("pick", "place"):
+            result = recovery_manager.execute_with_recovery(
+                env, action, env.entities, target_pos=place_pos if act_type == "place" else None
+            )
+            ok = result.get("success", False)
+            attempts = result.get("attempts", 1)
+            replanned = result.get("replanned", False)
+            print(f"     ok={ok}, attempts={attempts}, replanned={replanned}")
+            scheduler.mark_done(action)
+            memory.record_action(act_type, obj_name or pick_name, tgt_name if act_type == "place" else None)
+            results.append({"action": act_type, "object": obj_name or pick_name,
+                            "ok": ok, "attempts": attempts, "replanned": replanned})
+        else:
+            result = env.execute_action(action)
+            ok = result.get("ok", False)
+            print(f"     ok={ok}")
+            scheduler.mark_done(action)
+            results.append({"action": act_type, "ok": ok})
+
+    # ═══ 8. VERIFY ════════════════════════════════════════════
+    header("Step 8: Verify")
+
+    img_after = cam.render()
+    cam.render_and_save("demo/output/full_after.png")
+
+    verifier.capture_before(img_before)
+    verifier.capture_after(img_after)
+    cam_verify = verifier.verify(INSTRUCTION)
+    print(f"  Camera verify: success={cam_verify['success']}, "
+          f"confidence={cam_verify.get('confidence', 0):.2f}")
+
+    memory.update_positions(env.entities)
+    nearest = None
+    min_dist = float("inf")
+    cube_final = env.entities[pick_name].get_pos().cpu().numpy()
+    for name, obj in env.entities.items():
         if name != pick_name:
             p = obj.get_pos().cpu().numpy()
-            orig = {"blue_cube":[0.4,0.2,0.02], "green_cube":[0.7,-0.1,0.02]}[name]
-            moved = np.sqrt((p[0]-orig[0])**2 + (p[1]-orig[1])**2)
-            print(f"    {name}: {moved*100:.1f}cm {'OK' if moved < 0.01 else 'moved'}")
+            d = np.linalg.norm(cube_final[:2] - p[:2])
+            if d < min_dist:
+                min_dist = d
+                nearest = name
+    if nearest:
+        mem_verify = memory.verify_placement(pick_name, nearest, proximity_threshold=0.15)
+        print(f"  Memory verify: success={mem_verify['success']}, "
+              f"dist={mem_verify['distance_to_target']:.3f}m to {nearest}")
 
-    # ═══ 6. RECORD ══════════════════════════════════════════
-    print("\n[6/8] Save outputs...")
-    img_after = camera.render()[0]
-    Image.fromarray(img_after).save("demo/output/visual_after.png")
+    disturbed = []
+    for name in env.entities:
+        if name != pick_name:
+            p = env.entities[name].get_pos().cpu().numpy()
+            delta = np.linalg.norm(p[:2] - pre_pos[name][:2])
+            if delta > 0.01:
+                disturbed.append((name, delta))
+            print(f"  {name}: {'disturbed' if delta > 0.01 else 'OK'} ({delta*100:.2f}cm)")
+
+    place_target = np.array(place_pos[:2])
+    final_err = float(np.linalg.norm(cube_final[:2] - place_target))
+    overall = "SUCCESS" if (final_err < 0.10 and len(disturbed) == 0) else "PARTIAL"
+
+    # ═══ OUTPUT ════════════════════════════════════════════════
+    print("\n  Saving outputs...")
+    for _ in range(30):
+        env.scene.step(2)
+        env.vis_cam.render()
+    env.stop_recording("demo/output/full_demo.mp4", fps=30)
 
     import cv2
-    h,w = img_before.shape[:2]
-    canvas = np.zeros((h+40,w*2,3), dtype=np.uint8)
-    canvas[:h,:w] = img_before; canvas[:h,w:] = img_after
-    cv2.rectangle(canvas,(0,h),(w*2,h+40),(30,30,30),-1)
-    cv2.putText(canvas,"Before",(w//2-40,h+30),cv2.FONT_HERSHEY_SIMPLEX,1.0,(200,200,200),2)
-    cv2.putText(canvas,"After",(w+w//2-30,h+30),cv2.FONT_HERSHEY_SIMPLEX,1.0,(0,255,200),2)
-    Image.fromarray(canvas).save("demo/output/visual_comparison.png")
+    h, w = img_before.shape[:2]
+    canvas = np.zeros((h + 50, w * 2, 3), dtype=np.uint8)
+    canvas[:h, :w] = img_before
+    canvas[:h, w:] = img_after
+    cv2.rectangle(canvas, (0, h), (w * 2, h + 50), (30, 30, 30), -1)
+    cv2.putText(canvas, f"Before | VLM: {vlm_ms:.0f}ms", (10, h + 35),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.8, (200, 200, 200), 2)
+    cv2.putText(canvas, f"After | Err: {final_err*100:.1f}cm", (w + 10, h + 35),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 200), 2)
+    cv2.line(canvas, (w, 0), (w, h), (100, 100, 100), 2)
+    Image.fromarray(canvas).save("demo/output/full_comparison.png")
 
-    # ═══ 7. SUMMARY ══════════════════════════════════════════
-    print("\n[7/8] Complete Pipeline Summary:")
-    print(f"  ┌─────────────────────────────────────────┐")
-    print(f"  │ Qwen3-VL ({vlm_ms:.0f}ms) → pick={pick_name}      │")
-    print(f"  │ Suction Pick → Lifted: {lifted}              │")
-    print(f"  │ Suction Place → Error: {err*100:.1f}cm            │")
-    print(f"  │ Verify: 0 objects disturbed              │")
-    print(f"  │ Status: {'SUCCESS' if err < 0.10 else 'NEEDS WORK':^28s} │")
-    print(f"  └─────────────────────────────────────────┘")
+    verification = {
+        "task": INSTRUCTION,
+        "pipeline": "GraspEnv → TaskPlanner → ActionScheduler → execute_action",
+        "vlm_decision": {
+            "pick": pick_name, "place_relative": place_relative,
+            "reasoning": reasoning, "inference_ms": round(vlm_ms),
+        },
+        "plan": {"steps": action_steps, "inference_ms": round(plan.get("inference_ms", 0))},
+        "execution_results": results,
+        "placement": {
+            "target": [round(x, 3) for x in place_pos],
+            "final": [round(float(x), 3) for x in cube_final],
+            "error_cm": round(final_err * 100, 2),
+        },
+        "verification": {
+            "camera": cam_verify,
+            "disturbed": [{"name": n, "delta_cm": round(d * 100, 2)} for n, d in disturbed],
+        },
+        "overall_status": overall,
+    }
+    with open("demo/output/verification.json", "w") as f:
+        json.dump(verification, f, indent=2, default=float)
+
+    print(f"\n{'='*60}")
+    print(f"  PIPELINE SUMMARY")
+    print(f"{'='*60}")
+    print(f"  Env:       GraspEnv (GPU tensors, no numpy in hot path)")
+    print(f"  VLM:       Qwen3-VL-8B via vLLM | {vlm_ms:.0f}ms")
+    print(f"  Planner:   TaskPlanner → {len(action_steps)} steps")
+    print(f"  Scheduler: ActionScheduler → {len(results)} executed")
+    print(f"  Place:     error {final_err*100:.1f}cm")
+    print(f"  Verify:    camera={cam_verify['success']} | disturbed={len(disturbed)}")
+    print(f"  Status:    {overall}")
+    print(f"{'='*60}")
+
 
 if __name__ == "__main__":
     main()

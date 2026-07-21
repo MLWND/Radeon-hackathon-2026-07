@@ -143,12 +143,19 @@ def resolve_place_position(place_relative: str, objects: dict, table_top=0.0, cu
     # Try to find a reference object
     ref_name = None
     for name in objects:
-        if name in lower:
+        if name in lower or name.split("_")[0] in lower:
             ref_name = name
             break
 
     if ref_name and ref_name in objects:
-        ref_pos = objects[ref_name].get_pos().cpu().numpy()
+        ref_obj = objects[ref_name]
+        # Handle both entity objects and position lists
+        if hasattr(ref_obj, 'get_pos'):
+            ref_pos = ref_obj.get_pos().cpu().numpy()
+        elif hasattr(ref_obj, 'cpu'):
+            ref_pos = ref_obj.cpu().numpy()
+        else:
+            ref_pos = np.array(ref_obj)
         gap = cube_size * 1.5  # 6cm — one cube width + small gap
         # Place next to reference object
         if "right" in lower or "east" in lower:

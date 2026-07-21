@@ -21,7 +21,14 @@ class SceneMemory:
     def initialize(self, scene_objects: Dict):
         """Initialize with Genesis scene objects."""
         for name, entity in scene_objects.items():
-            pos = entity.get_pos().tolist()
+            pos_raw = entity.get_pos()
+            # Handle both tensor and numpy array returns
+            if hasattr(pos_raw, 'cpu'):
+                pos = pos_raw.cpu().numpy().tolist()
+            elif hasattr(pos_raw, 'tolist'):
+                pos = pos_raw.tolist()
+            else:
+                pos = list(pos_raw)
             self.objects[name] = {
                 "position": pos,
                 "initial_position": pos.copy(),
@@ -79,6 +86,81 @@ class SceneMemory:
                 "moved": info.get("moved", False),
             } for name, info in self.objects.items()},
             "task_log": self.task_log[-10:],  # Last 10 actions
+        }
+
+    # ── Scene Graph / Spatial Relations ────────────────────
+
+    def get_spatial_relation(self, obj_a: str, obj_b: str) -> str:
+        """Describe spatial relation between two objects.
+
+        Returns human-readable relation like "left of", "right of", "behind", "in front of", "near".
+        """
+        pos_a = self.get_position(obj_a)
+        pos_b = self.get_position(obj_b)
+        if not pos_a or not pos_b:
+            return "unknown"
+
+        dx = pos_a[0] - pos_b[0]  # x: front/back (positive = in front)
+        dy = pos_a[1] - pos_b[1]  # y: left/right (positive = left)
+        dz = pos_a[2] - pos_b[2]  # z: above/below
+
+        # Determine primary relation
+        abs_dx, abs_dy, abs_dz = abs(dx), abs(dy), abs(dz)
+        max_dim = max(abs_dx, abs_dy, abs_dz)
+
+        if max_dim < 0.05:
+            return "near"
+
+        if max_dim == abs_dx:
+            return "in front of" if dx > 0 else "behind"
+        elif max_dim == abs_dy:
+            return "left of" if dy > 0 else "right of"
+        else:
+            return "above" if dz > 0 else "below"
+
+    def describe_scene(self) -> str:
+        """Generate natural language description of the scene with spatial relations."""
+        names = list(self.objects.keys())
+        if not names:
+            return "Empty scene."
+
+        lines = [f"Scene contains {len(names)} objects:"]
+        for name, info in self.objects.items():
+            pos = info["position"]
+            color = info.get("color", "unknown")
+            moved = " (moved)" if info.get("moved") else ""
+            lines.append(f"  - {name}: {color} at [{pos[0]:.2f}, {pos[1]:.2f}, {pos[2]:.2f}]{moved}")
+
+        # Add spatial relations between pairs
+        if len(names) >= 2:
+            lines.append("Spatial relations:")
+            for i in range(len(names)):
+                for j in range(i + 1, len(names)):
+                    rel = self.get_spatial_relation(names[i], names[j])
+                    lines.append(f"  - {names[i]} is {rel} {names[j]}")
+
+        return "\n".join(lines)
+
+    def get_scene_graph(self) -> Dict:
+        """Return structured scene graph with objects and relations."""
+        names = list(self.objects.keys())
+        relations = []
+        for i in range(len(names)):
+            for j in range(len(names)):
+                if i != j:
+                    rel = self.get_spatial_relation(names[i], names[j])
+                    relations.append({
+                        "subject": names[i],
+                        "relation": rel,
+                        "object": names[j],
+                    })
+        return {
+            "objects": {name: {
+                "position": info["position"],
+                "color": info.get("color"),
+                "moved": info.get("moved", False),
+            } for name, info in self.objects.items()},
+            "relations": relations,
         }
 
     def _snapshot(self, label: str):

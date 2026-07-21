@@ -2,7 +2,28 @@
 
 > **Radeon Hackathon 2026-07, Track 3: Physical AI Challenge**
 
+English | [中文](README_CN.md)
+
 Qwen3-VL-8B (VLM) + Genesis (GPU Physics) + Suction Gripper (Weld Constraint) + AMD ROCm
+
+## Demo Video
+
+![Demo Comparison](demo/output/full_comparison.png)
+
+**Full Demo Video**: [demo/output/test_e2e.mp4](demo/output/test_e2e.mp4)
+
+## Final Test Results
+
+| Metric | Result |
+|--------|--------|
+| Overall Status | **SUCCESS** ✅ |
+| Placement Error | **0.3cm** |
+| Objects Disturbed | **0** |
+| Video Duration | **34.4 seconds** |
+| Frame Count | **1032 frames** |
+| VLM Inference | **1.8s** |
+| Pick Time | **8.9s** |
+| Place Time | **3.4s** |
 
 ## Quick Start
 
@@ -29,18 +50,6 @@ Camera        → pixel verify + scene memory + fail detector
 ```
 
 **Full pipeline: ~9.2s end-to-end on AMD ROCm GPU (excl. one-time setup)**
-
-## Demo Results
-
-| Metric | Value |
-|--------|-------|
-| VLM Model | Qwen3-VL-8B-Instruct (via vLLM 0.25.1) |
-| VLM Inference | 1.8s |
-| Suction Pick | 6.4s (OMPL + weld + PD lift) |
-| Suction Place | 1.0s (PD descent + unweld) |
-| Placement Error | 0.5cm |
-| Objects Disturbed | 0 |
-| Status | **SUCCESS** |
 
 ## Tech Stack
 
@@ -72,16 +81,72 @@ User: "Pick the red cube and place it next to the blue cube"
   ├─ Scene Memory → Position Resolution
   ├─ Task Planner → Action Decomposition
   ├─ OMPL Plan Path → Collision-free Approach
-  ├─ Suction Pick → Weld Constraint + PD Lift (6.4s)
-  ├─ Suction Place → PD Descent + Unweld (1.0s)
+  ├─ Suction Pick → Weld Constraint + PD Lift (8.9s)
+  ├─ Suction Place → PD Descent + Unweld (3.4s)
   └─ Verification → Pixel + Scene Memory + Fail Detector (0.1s)
 ```
+
+## Project Structure
+
+```
+├── src/                           # Core source code
+│   ├── control/primitives.py      # Robot control pipeline
+│   ├── envs/grasp_env.py          # Grasping environment (core)
+│   ├── planner/
+│   │   ├── action_scheduler.py    # Action scheduler
+│   │   ├── recovery.py            # Fault recovery (9 fault modes)
+│   │   └── task_planner.py        # Task planner
+│   └── vision/
+│       ├── camera.py              # Camera wrapper
+│       ├── qwen3vl.py             # VLM perception
+│       ├── scene_memory.py        # Scene memory
+│       └── verifier.py            # Verifier
+├── demo/
+│   ├── full_demo.py               # Full closed-loop demo
+│   └── test_e2e.py                # End-to-end test
+└── tests/
+    └── test_recovery_replan.py    # Fault recovery tests
+```
+
+## Fault Recovery System
+
+The system implements 9 fault modes with detection and retry:
+
+| Fault Type | Detection | Retry Strategy |
+|------------|-----------|----------------|
+| grasp_failure | Object didn't move | Re-grasp |
+| drop_failure | Z coordinate dropped | Re-grasp + place |
+| position_drift | Deviated from target | Re-grasp + precise place |
+| ik_failure | IK solve failed | Adjust position retry |
+| convergence_failure | PD not converged | Wait + retry |
+| path_planning_failure | Path planning failed | Adjust height retry |
+| weld_constraint_failure | Weld failed | Reset + retry |
+| execution_exception | Execution exception | Recovery + retry |
+| action_failure | Action failed | Generic retry |
+
+## Key Optimizations
+
+### Precision Optimization
+- Use Genesis official IK solver
+- Use official grasp height (0.130m)
+- Placement error: 2.91cm → **0.3cm**
+
+### Object Disturbance Elimination
+- Use plan_path collision avoidance
+- yellow_cylinder disturbance: 59cm → **0cm**
+
+### Video Recording Fix
+- Auto-record every frame
+- Video duration: 1s → **34.4s**
 
 ## Project Docs
 
 - [Architecture](docs/ARCHITECTURE.md) — system design and module list
-- [MVP Plan](docs/MVP.md) — development timeline and results
-- [Technical README](docs/README.md) — detailed pipeline and performance
+- [Technical Report](docs/TECHNICAL_REPORT.md) — detailed pipeline and performance
+- [Final Summary](docs/FINAL_SUMMARY.md) — complete project summary
+- [Optimization Report](docs/OPTIMIZATION_REPORT.md) — precision and disturbance optimization
+- [Fault Mode Coverage](docs/FAULT_MODE_COVERAGE.md) — 9 fault modes analysis
+- [Verification Report](docs/VERIFICATION_REPORT.md) — verification results
 
 ---
 

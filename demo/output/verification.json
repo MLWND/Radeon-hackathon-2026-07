@@ -1,0 +1,41 @@
+{
+  "task": "Pick the red cube and place it next to the blue cube",
+  "env": "GraspEnv (GPU tensors)",
+  "vlm_decision": {
+    "pick": "red_cube",
+    "place_relative": "next to the blue cube",
+    "inference_ms": 1797
+  },
+  "grasp_verification": {
+    "method": "object_height_change",
+    "z_before": 0.019,
+    "z_after_pick": 0.1693,
+    "lifted": true
+  },
+  "placement_verification": {
+    "method": "euclidean_xy",
+    "target": [
+      0.46000000834465027,
+      0.20000000298023224,
+      0.02
+    ],
+    "final": [
+      0.462,
+      0.198,
+      0.02
+    ],
+    "error_cm": 0.29,
+    "passed": true
+  },
+  "disturbance_verification": {
+    "method": "object_position_delta",
+    "disturbed": [],
+    "passed": true
+  },
+  "camera_verification": {
+    "method": "pixel_diff",
+    "success": true,
+    "mean_diff": "Pixel difference: mean=2.4, max=232"
+  },
+  "overall_status": "SUCCESS"
+}

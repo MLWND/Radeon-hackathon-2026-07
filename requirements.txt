@@ -4,7 +4,7 @@
 # Genesis physics simulation
 genesis-world @ git+https://github.com/Genesis-Embodied-AI/Genesis.git@817debb7411a230d20837c747dc9c19619b19757
 
-# VLM (Qwen3-VL)
+# VLM (Qwen3-VL-8B)
 transformers>=4.57
 accelerate
 
@@ -23,3 +23,8 @@ numpy
 pillow
 pyyaml
 requests
+
+# Optional: for development
+# pytest
+# black
+# ruff

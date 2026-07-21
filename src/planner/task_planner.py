@@ -103,42 +103,79 @@ class TaskPlanner:
         return self._parse_json(response)
 
     def _smart_parse(self, instruction: str) -> Dict:
-        """Enhanced rule-based parser with multi-step support."""
+        """Enhanced rule-based parser with multi-step pick-place pairs.
+
+        Splits compound instructions on connectors ("then", "and", ";", Chinese
+        punctuation). Each segment adds an action; consecutive pick/place
+        fragments are stitched into full pick-then-place units. Produces a
+        flat list that an ActionScheduler loops over until done.
+        """
         lower = instruction.lower()
         steps = []
 
-        # Split by "then", "and", "after that", "，", "。"
+        # Split by sentence-level connectors
         import re
-        segments = re.split(r'\s+then\s+|, then\s+| and then\s+| after that\s+|\s+and\s+|，|。|;', lower)
+        segments = re.split(
+            r'\s+then\s+|, then\s+| and then\s+| after that\s+|\s+and\s+|，|。|;|\s+after\s+that\s+',
+            lower,
+        )
 
+        last_pick_object = None
         for seg in segments:
             seg = seg.strip()
             if not seg:
                 continue
 
-            # Detect action type
-            if any(kw in seg for kw in ["pick", "grab", "lift", "拿", "抓", "取"]):
-                obj = self._find_object(seg)
-                steps.append({"action": "pick", "object": obj, "description": f"Grasp the {obj}"})
-            elif any(kw in seg for kw in ["place", "put", "move", "放", "进", "到"]):
-                tgt = self._find_target(seg)
-                steps.append({"action": "place", "target": tgt, "description": f"Place at {tgt}"})
-            else:
-                # Default: try to detect pick then place
-                obj = self._find_object(seg)
-                tgt = self._find_target(seg)
-                if obj:
-                    steps.append({"action": "pick", "object": obj, "description": f"Grasp the {obj}"})
-                if tgt:
-                    steps.append({"action": "place", "target": tgt, "description": f"Place at {tgt}"})
+            pick_detected = any(kw in seg for kw in ["pick", "grab", "lift", "拿", "抓", "取"])
+            place_detected = any(kw in seg for kw in ["place", "put", "放", "进", "到"])
+            move_detected = any(kw in seg for kw in ["move", "移"])
 
-        # Fallback: if no steps detected, create default
+            if pick_detected:
+                obj = self._find_object(seg)
+                steps.append({"action": "pick", "object": obj,
+                              "description": f"Grasp the {obj}"})
+                last_pick_object = obj
+            elif place_detected:
+                tgt = self._find_target(seg)
+                obj = last_pick_object or self._find_object(seg)
+                steps.append({"action": "place", "object": obj, "target": tgt,
+                              "description": f"Place {obj} at {tgt}"})
+                last_pick_object = None  # consumed
+            elif move_detected:
+                obj = self._find_object(seg)
+                tgt = self._find_target(seg)
+                if last_pick_object is None and obj:
+                    steps.append({"action": "pick", "object": obj,
+                                  "description": f"Grasp the {obj}"})
+                    last_pick_object = obj
+                if tgt:
+                    steps.append({"action": "place", "object": last_pick_object or obj,
+                                  "target": tgt,
+                                  "description": f"Place at {tgt}"})
+                    last_pick_object = None
+            else:
+                # Fallback within segment: detect both
+                obj = self._find_object(seg)
+                tgt = self._find_target(seg)
+                if obj and (pick_detected or last_pick_object is None):
+                    steps.append({"action": "pick", "object": obj,
+                                  "description": f"Grasp the {obj}"})
+                    last_pick_object = obj
+                if tgt:
+                    steps.append({"action": "place", "object": last_pick_object or obj,
+                                  "target": tgt,
+                                  "description": f"Place at {tgt}"})
+                    last_pick_object = None
+
+        # Final fallback: nothing parsed -> default single pick-place
         if not steps:
             obj = self._find_object(lower)
             tgt = self._find_target(lower)
             steps = [
-                {"action": "pick", "object": obj, "description": f"Grasp the {obj}"},
-                {"action": "place", "target": tgt, "description": f"Place at {tgt}"},
+                {"action": "pick", "object": obj,
+                 "description": f"Grasp the {obj}"},
+                {"action": "place", "object": obj, "target": tgt,
+                 "description": f"Place {obj} at {tgt}"},
             ]
 
         return {
@@ -146,14 +183,16 @@ class TaskPlanner:
             "steps": steps,
         }
 
+
     def _find_object(self, text: str) -> str:
         objects = [
             ("red_cube", ["red cube", "red_cube", "red cup", "cup", "红色", "杯子", "red"]),
             ("blue_cube", ["blue cube", "blue_cube", "blue cup", "蓝色", "blue"]),
             ("green_cube", ["green cube", "green_cube", "绿色", "green"]),
             ("yellow_cube", ["yellow cube", "yellow_cube", "黄色", "yellow"]),
+            ("yellow_cylinder", ["yellow cylinder", "yellow_cylinder", "cylinder", "圆柱", "柱子", "黄色圆柱"]),
+            ("purple_sphere", ["purple sphere", "purple_sphere", "sphere", "球", "紫色球", "紫色"]),
             ("orange_cube", ["orange cube", "orange_cube", "橙色", "orange"]),
-            ("purple_cube", ["purple cube", "purple_cube", "紫色", "purple"]),
             ("cyan_cube", ["cyan cube", "cyan_cube", "青色", "cyan"]),
             ("white_cube", ["white cube", "white_cube", "白色", "white"]),
             ("apple", ["apple", "苹果"]),
@@ -170,6 +209,8 @@ class TaskPlanner:
             ("blue_cube", ["blue cube", "blue_cube", "blue box", "蓝色", "blue"]),
             ("red_cube", ["red cube", "red_cube", "red", "红色"]),
             ("green_cube", ["green cube", "green_cube", "green", "绿色"]),
+            ("yellow_cylinder", ["yellow cylinder", "yellow_cylinder", "cylinder", "圆柱"]),
+            ("purple_sphere", ["purple sphere", "purple_sphere", "sphere", "球"]),
             ("table", ["table", "桌子"]),
         ]
         for name, keywords in targets:

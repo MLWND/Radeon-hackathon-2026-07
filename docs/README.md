@@ -1,30 +1,27 @@
 # RoboPilot
 
-**Vision-Language Physical AI Robot on AMD GPU**
+**Vision-Language Physical AI Robot on AMD Radeon GPU**
 
 > Qwen3-VL-8B (Brain) + Genesis (Physics) + Suction Gripper (Hand) + ROCm (Compute)
 
-## Demo
+## Quick Start
 
 ```bash
-# 1. Setup environment (one-time)
+# 1. Setup (one-time)
 bash setup.sh
 
-# 2. Run full demo
+# 2. Run demo
 source venv/bin/activate
 python3 demo/full_demo.py
 
-# 3. Run comprehensive E2E test (all modules)
+# 3. Run E2E test (all modules)
 python3 demo/test_e2e.py
-```
 
-**Output:**
-```
-Qwen3-VL → pick=red_cube, place="next to the blue cube"     (1.8s)
-Suction Pick → OMPL plan_path + weld constraint + PD lift    (6.4s)
-Suction Place → PD descent + unweld                          (1.0s)
-Verify → pixel check + scene memory + fail detector          (0.1s)
-Status: SUCCESS (0.5cm placement error, 0 objects disturbed)
+# 4. Train RL policy
+python3 src/train_grasp.py -B 64 --max_iterations 300
+
+# 5. Behavior cloning (after RL training)
+python3 src/grasp_bc.py --max_iterations 200
 ```
 
 ## Pipeline
@@ -32,75 +29,76 @@ Status: SUCCESS (0.5cm placement error, 0 objects disturbed)
 ```
 User: "Pick the red cube and place it next to the blue cube"
   │
-  ├─ [0.9s]   Genesis init (AMD ROCm GPU)
-  ├─ [24s]    Scene build (one-time, compiles GPU kernels)
-  ├─ [1.8s]   Qwen3-VL-8B perception via vLLM → JSON
-  ├─ [0.1s]   Task planner → action decomposition
-  ├─ [6.4s]   OMPL plan_path → approach → weld → PD lift
-  ├─ [1.0s]   PD descent → unweld → settle
-  ├─ [0.1s]   Verification (pixel + scene memory + fail detector)
+  ├─ [1.8s]   Qwen3-VL-8B via vLLM → object detection + spatial grounding
+  ├─ [0.1s]   Task Planner → keyword-based instruction decomposition
+  ├─ [0.1s]   Action Scheduler → sequence execution
+  ├─ [6.4s]   GraspEnv.suction_pick → OMPL plan_path + weld + PD lift
+  ├─ [1.0s]   GraspEnv.suction_place → PD descent + unweld + settle
+  ├─ [0.1s]   Verification (camera + scene memory + failure detector)
   │
-  └─ Total: ~9.2s end-to-end (excl. one-time setup)
+  └─ Total: ~9.5s end-to-end (excl. one-time scene build)
 ```
 
 ## Architecture
 
 ```
-Qwen3-VL-8B (vLLM, AMD ROCm GPU, ~1.8s)
+Qwen3-VL-8B (vLLM on AMD ROCm GPU, ~1.8s)
       │
       ▼
-Scene Memory (object registry + position tracking)
+Scene Memory (object registry + position tracking + spatial relations)
       │
       ▼
-Task Planner (instruction → pick → place steps)
+Task Planner (keyword-based instruction decomposition)
       │
       ▼
-OMPL RRTConnect (collision-free motion planning)
+Action Scheduler (sequential action dispatch)
       │
       ▼
-Genesis 1.2.2 (GPU physics simulation, 200+ FPS)
-      ├── Franka Panda (MJCF, 9 DOF)
+GraspEnv (unified Gym-style environment)
+      ├── Manipulator (Franka Panda, 9 DOF, MJCF)
       ├── Suction Gripper (weld constraint)
-      ├── Ground plane (no table, official pattern)
+      ├── OMPL RRTConnect (collision-free motion planning)
       ├── RigidOptions (Newton solver, box_box_detection)
-      └── Camera (1280x720 RGB)
+      └── Stereo Camera (RasterizerCameraOptions, 64×64)
       │
       ▼
 Verification Pipeline
-      ├── Scene Memory (position tracking + placement check)
       ├── Camera Verify (before/after pixel comparison)
-      └── Fail Detector (grasp + placement + disturbance check)
+      ├── Scene Memory (position tracking + placement check)
+      └── Failure Detector (grasp + placement + disturbance)
 ```
 
 ## Project Structure
 
 ```
 src/
+├── envs/
+│   └── grasp_env.py         # GraspEnv — unified Gym-style RL environment
+│                              #   - step(): delta-EE actions, 14-dim TensorDict obs
+│                              #   - suction_pick/place(): scripted control for demo
+│                              #   - keypoint reward: exp(-keypoint_distance)
+│                              #   - n_envs parallel support
+├── train_grasp.py            # PPO training (rsl-rl-lib, OnPolicyRunner)
+├── grasp_bc.py               # Behavior cloning (CNN vision encoder → action)
 ├── vision/
-│   ├── camera.py          # Genesis camera wrapper
-│   ├── qwen3vl.py         # Qwen3-VL perception (vLLM + rule-based fallback)
-│   ├── scene_memory.py    # Object tracking + placement verification
-│   └── verifier.py        # Camera before/after verification
-├── control/
-│   └── primitives.py      # ManipulationPipeline (plan_path + weld + PD)
-├── sim/
-│   └── scene_manager.py   # Genesis scene (ground plane + RigidOptions)
+│   ├── camera.py             # Genesis camera wrapper
+│   ├── qwen3vl.py            # Qwen3-VL perception (vLLM OpenAI API + fallback)
+│   ├── scene_memory.py       # Object tracking + placement verification
+│   └── verifier.py           # Camera before/after pixel verification
 ├── planner/
-│   ├── task_parser.py     # VLM output → action sequence
-│   ├── task_planner.py    # LLM + rule-based task decomposition
-│   ├── action_scheduler.py # Action sequencing with progress tracking
-│   └── recovery.py        # Failure detection + automatic replanning
-└── system/
-    └── orchestrator.py    # Full pipeline orchestrator
+│   ├── task_planner.py       # Instruction → action sequence (keyword + optional VLM)
+│   ├── action_scheduler.py   # Action sequencing with progress tracking
+│   └── recovery.py           # Failure detection + replanning
+└── sim/
+    └── scene_manager.py      # Genesis scene construction helpers
 
 demo/
-├── full_demo.py           # Complete VLM → pick → place → verify demo
-├── test_e2e.py            # Comprehensive E2E test (all 10 modules)
-├── train_episodes.py      # Multi-episode training loop
-└── output/
-    ├── visual_before.png  # Scene before manipulation
-    ├── visual_after.png   # Scene after manipulation
-    └── robopilot_demo.mp4 # Demo video
+├── full_demo.py              # Complete pipeline demo (GraspEnv + VLM + planner)
+├── test_e2e.py               # E2E test (all modules wired)
+└── output/                   # Demo outputs (images, video, verification.json)
+
+tests/
+└── test_recovery_replan.py   # Unit tests for recovery replanning logic
 ```
 
 ## Performance
@@ -112,10 +110,29 @@ demo/
 | Qwen3-VL Inference | 1.8s | Qwen3-VL-8B via vLLM (warm) |
 | OMPL Plan Path | ~5s | RRTConnect collision-free |
 | Suction Pick | 6.4s | plan_path + weld + PD lift |
-| Suction Place | 1.0s | PD descent + unweld |
-| Camera Render | 0.3s | 1280x720 RGB |
-| Verification | 0.1s | pixel + scene memory + fail detector |
-| **End-to-End** | **~9.2s** | Excl. one-time setup |
+| Suction Place | 1.0s | PD descent + unweld + settle |
+| Camera Render | 0.3s | 1280×720 RGB |
+| Verification | 0.1s | pixel + scene memory + failure detector |
+| **End-to-End** | **~9.5s** | Excl. one-time scene build |
+
+## RL Training
+
+GraspEnv follows the official Genesis `grasp_env.py` pattern:
+
+```python
+env = GraspEnv(num_envs=64, ctrl_dt=0.01)
+obs = env.reset()           # 14-dim: (finger_pos-obj_pos, finger_quat, obj_pos, obj_quat)
+obs, reward, done, info = env.step(action)  # 6D delta-EE, keypoint reward
+```
+
+Training:
+```bash
+# Stage 1: RL teacher (PPO, 2048 parallel envs)
+python3 src/train_grasp.py -B 2048 --max_iterations 300
+
+# Stage 2: Behavior cloning (stereo RGB → action)
+python3 src/grasp_bc.py -B 10 --max_iterations 200
+```
 
 ## Technology Stack
 
@@ -123,46 +140,18 @@ demo/
 |-----------|-----------|---------|
 | VLM | Qwen/Qwen3-VL-8B-Instruct | via vLLM 0.25.1 |
 | Physics | Genesis | 1.2.2 |
-| Robot | Franka Panda (MJCF, panda.xml) | — |
+| Robot | Franka Panda (MJCF, panda.xml) | 9 DOF |
 | Gripper | Suction (weld constraint) | — |
+| RL Framework | rsl-rl-lib | 5.4.2 (PPO) |
 | GPU Backend | gs.amdgpu | ROCm 7.2 |
-| PyTorch | torch+rocm | 2.11.0+gitd0c8b1f |
+| PyTorch | torch+rocm | 2.11.0 |
 | Python | CPython | 3.12 |
 | GPU | AMD Radeon Graphics | 48GB VRAM |
-
-## Key Design: Official Genesis Patterns
-
-All code follows official Genesis examples (genesis-world-main/examples/):
-
-```python
-# Ground plane only (no kinematic table — causes arm clipping)
-scene.add_entity(gs.morphs.Plane())
-
-# RigidOptions for cube-cube collision + Newton solver
-gs.options.RigidOptions(box_box_detection=True, constraint_solver=gs.constraint_solver.Newton)
-
-# Official suction pick: plan_path → control_dofs_position → weld → lift
-path = robot.plan_path(qpos_goal=qpos_above, num_waypoints=100)
-for waypoint in path:
-    robot.control_dofs_position(waypoint)
-    scene.step()
-rigid_solver.add_weld_constraint(cube_idx, hand_idx)
-
-# Official suction place: control_dofs_position → unweld → settle
-robot.control_dofs_position(qpos_reach, motors_dof)
-rigid_solver.delete_weld_constraint(cube_idx, hand_idx)
-```
-
-## Known Limitations
-
-- VLM inference ~1.8s (could be faster with 2B model, but 8B has better reasoning)
-- OMPL planning takes ~5s (could be cached for repeated tasks)
-- Single-task execution only (official Genesis benchmark pattern)
-- Placement accuracy ~0.5cm (acceptable for competition demo)
 
 ## Environment
 
 - AMD Radeon Graphics (48GB VRAM)
 - Ubuntu 24.04, ROCm 7.2
-- Python 3.12, PyTorch 2.11.0+gitd0c8b1f
-- Genesis 1.2.2, vLLM 0.25.1, Transformers 5.14.1
+- Python 3.12, PyTorch 2.11.0
+- Genesis 1.2.2, vLLM 0.25.1
+- rsl-rl-lib 5.4.2, tensordict 0.13.0

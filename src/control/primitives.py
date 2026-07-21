@@ -124,8 +124,11 @@ class ManipulationPipeline:
 
     def _jacobian_dls_ik(self, target, qpos_init, max_iter=50, lam=0.01, tol=0.005):
         """Damped Least Squares IK via finite-difference Jacobian."""
+        # Save original state
+        original_qpos = self._to_numpy(self.robot.get_qpos()).copy()
+        
         q = self._to_numpy(qpos_init).copy()[: self.n_arm]
-        cur_full = self._to_numpy(self.robot.get_qpos())
+        cur_full = original_qpos.copy()
         for _ in range(max_iter):
             cur_full[: self.n_arm] = q
             self.robot.set_qpos(cur_full)
@@ -145,10 +148,74 @@ class ManipulationPipeline:
             # DLS
             dq = J.T @ np.linalg.inv(J @ J.T + (lam ** 2) * np.eye(3)) @ err
             q = np.clip(q + dq, -np.pi, np.pi)
-        cur_full[: self.n_arm] = q
-        cur_full[-2:] = 0.04
-        self.robot.set_qpos(cur_full)  # leave in solved state
-        return cur_full
+        
+        # Restore original state
+        self.robot.set_qpos(original_qpos)
+        
+        # Return the solved qpos without modifying robot state
+        result_full = original_qpos.copy()
+        result_full[: self.n_arm] = q
+        result_full[-2:] = 0.04
+        return result_full
+
+    # ── Delta End-Effector Action (6D Cartesian + DLS IK) ────
+    # Follows official grasp_env.py: action = [dx,dy,dz,drx,dry,drz]
+    # rescaled by action_scales, IK'd via DLS, applied as control_dofs_position.
+
+    def apply_delta_action(self, delta_action: np.ndarray, open_gripper: bool = True,
+                           action_scale: float = 0.05):
+        """Apply a 6D delta-EE action via DLS IK (official RL pattern).
+
+        delta_action: [dx, dy, dz, drx, dry, drz] (already scaled by caller,
+                      or pass action_scale>0 to scale internally).
+        open_gripper: True = open fingers (pre-grasp), False = close.
+        """
+        # Rescale
+        scaled = np.asarray(delta_action, dtype=np.float64).flatten()[:6] * action_scale
+        cur_q = self._to_numpy(self.robot.get_qpos())
+        ee_pos = self._to_numpy(self.ee_link.get_pos())
+        ee_quat = self._to_numpy(self.ee_link.get_quat())
+
+        # Position: target = current + delta
+        target_pos = ee_pos + scaled[:3]
+        # Orientation: keep current (always top-down for this robot)
+        # Use Genesis closed-form IK with the new target
+        q_pos = self.robot.inverse_kinematics(
+            link=self.ee_link,
+            pos=torch.tensor(target_pos, dtype=torch.float32, device=gs.device),
+            quat=torch.tensor([0, 1, 0, 0], dtype=torch.float32, device=gs.device),
+        )
+        q_pos = self._to_numpy(q_pos)
+        # Gripper
+        q_pos[self.fingers_dof] = 0.04 if open_gripper else 0.0
+
+        # Apply via PD position controller (will be held for next step)
+        self.robot.control_dofs_position(
+            torch.tensor(q_pos, dtype=torch.float32, device=gs.device),
+            torch.arange(self.n_dofs, device=gs.device),
+        )
+
+    def apply_delta_action_dls(self, delta_action: np.ndarray, open_gripper: bool,
+                                action_scale: float = 0.05, lam: float = 0.01):
+        """Damped Least Squares delta action using Genesis Jacobian (official pattern).
+
+        Solves (J @ J^T + lam^2 * I) @ y = dx, then dq = J^T @ y.
+        """
+        scaled = np.asarray(delta_action, dtype=np.float64).flatten()[:6] * action_scale
+        J = self._to_numpy(self.robot.get_jacobian(link=self.ee_link))  # [6, 9]
+        J_arm = J[:, :self.n_arm]  # [6, 7]
+        cur_q = self._to_numpy(self.robot.get_qpos())
+        # DLS solve on CPU numpy (single env, small)
+        A = J_arm @ J_arm.T + (lam ** 2) * np.eye(6)
+        y = np.linalg.solve(A, scaled)
+        dq = J_arm.T @ y  # [7]
+        new_q = cur_q.copy()
+        new_q[:self.n_arm] = np.clip(cur_q[:self.n_arm] + dq, -np.pi, np.pi)
+        new_q[self.fingers_dof] = 0.04 if open_gripper else 0.0
+        self.robot.control_dofs_position(
+            torch.tensor(new_q, dtype=torch.float32, device=gs.device),
+            torch.arange(self.n_dofs, device=gs.device),
+        )
 
     # ── PD Hold with Convergence Check ─────────────────────────
 
@@ -220,7 +287,7 @@ class ManipulationPipeline:
 
         # Reach to place height
         qpos_reach = self.solve_ik(tp[0], tp[1], tp[2] + 0.18)
-        self._pd_hold_and_check(qpos_reach[:-2], 100)
+        self._pd_hold_and_check(qpos_reach[:-2], 200)
 
         # Release + settle
         self.rigid_solver.delete_weld_constraint(cube_link_idx, hand_link_idx)
@@ -281,7 +348,8 @@ class ManipulationPipeline:
         tgt = action.get("target", "")
         if act == "pick":
             if obj in self.entities:
-                return {"ok": True, "result": self.suction_pick(obj)}
+                lifted = self.suction_pick(obj)
+                return {"ok": lifted, "result": lifted}
             return {"ok": False, "result": False, "reason": f"unknown object {obj}"}
         if act == "place":
             if obj == "":
@@ -295,7 +363,8 @@ class ManipulationPipeline:
                 tp = self._to_numpy(self.entities[tgt].get_pos()).tolist()
             else:
                 tp = [0.55, 0.0, 0.02]
-            return {"ok": True, "result": self.suction_place(obj, tp)}
+            err = self.suction_place(obj, tp)
+            return {"ok": err < 0.10, "result": err}
         if act == "move_above":
             name = obj or tgt
             if name in self.entities:
